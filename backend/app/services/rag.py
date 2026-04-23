@@ -253,7 +253,15 @@ class RAGService:
 
     def _normalized_tokens(self, text: str) -> list[str]:
         key = self._normalize_key(text)
-        return [self._alias_token(t) for t in self._tokenize_key(key)]
+        tokens = self._tokenize_key(key)
+        expanded: list[str] = []
+        for token in tokens:
+            expanded.append(token)
+            # Handle labels like company6/notary9 from OCR or forms.
+            alpha_only = re.sub(r"\d+", "", token)
+            if alpha_only and alpha_only != token:
+                expanded.append(alpha_only)
+        return [self._alias_token(t) for t in expanded if t]
 
     def _column_variants(self, column: str) -> set[str]:
         key = self._normalize_key(column)
@@ -272,6 +280,7 @@ class RAGService:
         q = question.lower()
         hints = [
             "sheet",
+            "page",
             "row",
             "column",
             "table",
@@ -283,15 +292,23 @@ class RAGService:
         ]
         return any(h in q for h in hints)
 
-    def _excel_chunks(self) -> list:
-        return [chunk for chunk in self.registry.all_chunks() if chunk.source_type == "excel"]
+    def _tabular_chunks(self) -> list:
+        return [
+            chunk
+            for chunk in self.registry.all_chunks()
+            if chunk.source_type == "excel" or str(chunk.metadata.get("record_type", "")) == "table_row"
+        ]
 
     def _sheet_hint(self, question: str) -> str | None:
         q = question.lower()
         match = re.search(r"\bsheet\s+([a-z0-9 _-]+)", q)
-        if not match:
-            return None
-        return self._normalize_key(match.group(1))
+        if match:
+            return self._normalize_key(match.group(1))
+
+        page_match = re.search(r"\bpage\s+(\d+)\b", q)
+        if page_match:
+            return self._normalize_key(f"page_{page_match.group(1)}")
+        return None
 
     def _row_hint(self, question: str) -> int | None:
         match = re.search(r"\brow\s+(\d+)\b", question.lower())
@@ -370,8 +387,8 @@ class RAGService:
         return [t for t in tokens if t not in stop]
 
     def _table_direct_answer(self, question: str, force_strict: bool | None = None) -> tuple[str | None, bool]:
-        excel_chunks = self._excel_chunks()
-        if not excel_chunks:
+        table_chunks = self._tabular_chunks()
+        if not table_chunks:
             return None, False
 
         strict_mode = (TABLE_LOOKUP_MODE or "strict").strip().lower() == "strict"
@@ -381,7 +398,7 @@ class RAGService:
 
         has_structured_rows = any(
             isinstance(chunk.metadata.get("row_data"), dict) and chunk.metadata.get("row_data")
-            for chunk in excel_chunks
+            for chunk in table_chunks
         )
         if is_table_query and not has_structured_rows:
             if strict_mode:
@@ -389,7 +406,7 @@ class RAGService:
             return None, False
 
         all_columns: set[str] = set()
-        for chunk in excel_chunks:
+        for chunk in table_chunks:
             row_data = chunk.metadata.get("row_data", {})
             if isinstance(row_data, dict):
                 all_columns.update(self._normalize_key(k) for k in row_data.keys())
@@ -411,7 +428,7 @@ class RAGService:
 
         if any(phrase in q for phrase in ["how many rows", "number of rows", "total rows"]):
             rows = set()
-            for chunk in excel_chunks:
+            for chunk in table_chunks:
                 row = chunk.metadata.get("row")
                 sheet = self._normalize_key(chunk.metadata.get("sheet", ""))
                 if isinstance(row, int):
@@ -422,7 +439,7 @@ class RAGService:
                 return str(len(rows)), False
 
         if requested_col and row_hint is not None:
-            for chunk in excel_chunks:
+            for chunk in table_chunks:
                 row = chunk.metadata.get("row")
                 sheet = self._normalize_key(chunk.metadata.get("sheet", ""))
                 if not isinstance(row, int) or row != row_hint:
@@ -443,7 +460,7 @@ class RAGService:
 
         best_chunk = None
         best_score = -1
-        for chunk in excel_chunks:
+        for chunk in table_chunks:
             sheet = self._normalize_key(chunk.metadata.get("sheet", ""))
             if sheet_hint and sheet_hint not in sheet:
                 continue
@@ -824,6 +841,8 @@ class RAGService:
         chat_history = chat_history or []
         normalized_mode = normalize_query_mode(query_mode)
         normalized_style = normalize_response_style(response_style)
+        if self._is_small_info_request(question):
+            top_k = min(top_k, 3)
 
         retrieval_start = time.perf_counter()
         all_chunks = self.registry.all_chunks()

@@ -83,11 +83,11 @@ class QueryResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=3)
-    top_k: int = Field(default=1, ge=1, le=10)
+    top_k: int = Field(default=5, ge=1, le=10)
     source_id: str | None = None
     chat_history: list[str] = Field(default_factory=list)
     query_mode: Literal["auto", "strict_lookup", "table_only", "rag_generate"] = "auto"
-    response_style: Literal["exact", "concise", "detailed", "analyst"] = "exact"
+    response_style: Literal["exact", "concise", "detailed", "analyst"] = "concise"
 
 
 class DocumentStats(BaseModel):

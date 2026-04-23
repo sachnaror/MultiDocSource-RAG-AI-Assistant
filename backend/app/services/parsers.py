@@ -31,13 +31,174 @@ class ParserService:
         normalized = re.sub(r"\s+([,.;:])", r"\1", normalized)
         return normalized
 
+    def _split_table_cells(self, line: str) -> list[str]:
+        raw = line.strip()
+        if not raw:
+            return []
+        if "|" in raw:
+            cells = [c.strip() for c in raw.split("|")]
+            cells = [c for c in cells if c]
+            return cells
+        cells = [c.strip() for c in re.split(r"\s{2,}|\t+", raw) if c.strip()]
+        return cells
+
+    def _looks_like_header(self, cells: list[str]) -> bool:
+        if len(cells) < 2:
+            return False
+        alpha_like = 0
+        for cell in cells:
+            token = cell.strip()
+            if re.search(r"[A-Za-z]", token):
+                alpha_like += 1
+        return alpha_like >= max(2, len(cells) - 1)
+
+    def _extract_pdf_table_records(self, raw_text: str, page_idx: int) -> list[dict[str, Any]]:
+        lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+        tokenized: list[tuple[int, list[str]]] = []
+        for line_idx, line in enumerate(lines):
+            cells = self._split_table_cells(line)
+            if len(cells) >= 2:
+                tokenized.append((line_idx, cells))
+
+        records: list[dict[str, Any]] = []
+        i = 0
+        while i < len(tokenized):
+            _, header_cells = tokenized[i]
+            if not self._looks_like_header(header_cells):
+                i += 1
+                continue
+
+            header = [self._normalize_col_name(c) for c in header_cells]
+            if len(set(header)) < 2:
+                i += 1
+                continue
+
+            row_num = 0
+            j = i + 1
+            while j < len(tokenized):
+                _, row_cells = tokenized[j]
+                # Stop when another likely header starts.
+                if self._looks_like_header(row_cells) and len(row_cells) == len(header):
+                    break
+                if len(row_cells) < 2:
+                    break
+
+                # Align row with header width.
+                row_cells = row_cells[: len(header)] + ([""] * max(0, len(header) - len(row_cells)))
+                row_data: dict[str, str] = {}
+                parts: list[str] = []
+                for col_name, value in zip(header, row_cells):
+                    clean_value = str(value).strip()
+                    if not col_name or not clean_value:
+                        continue
+                    row_data[col_name] = clean_value
+                    parts.append(f"{col_name}: {clean_value}")
+
+                if row_data:
+                    row_num += 1
+                    records.append(
+                        {
+                            "content": (
+                                f"Page: {page_idx} | TableRow: {row_num} | "
+                                + " | ".join(parts)
+                            ),
+                            "locator": f"Page {page_idx}, Table row {row_num}",
+                            "page_or_row": f"{page_idx}:{row_num}",
+                            "metadata": {
+                                "page": page_idx,
+                                "sheet": f"page_{page_idx}",
+                                "row": row_num,
+                                "columns": header,
+                                "row_data": row_data,
+                                "record_type": "table_row",
+                            },
+                        }
+                    )
+                j += 1
+
+            # Advance to next potential block.
+            i = j if j > i + 1 else i + 1
+
+        return records
+
+    def _extract_pdf_kv_records(self, raw_text: str, page_idx: int) -> list[dict[str, Any]]:
+        normalized = self._normalize_pdf_text(raw_text)
+        if not normalized:
+            return []
+
+        # Capture table/form-like "Field: Value" spans on each page.
+        # Keep label detection strict to avoid chopping values that contain
+        # title-cased phrases (for example long addresses).
+        label_boundary = r"(?:[A-Z][A-Za-z0-9()/_&.'-]*\s*){1,3}"
+        pattern = re.compile(
+            rf"([A-Z][A-Za-z0-9 ()/&._'-]{{2,70}}?)\s*:\s*(.+?)(?=\s+{label_boundary}:|$)"
+        )
+
+        records: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        row_num = 0
+
+        for key_raw, value_raw in pattern.findall(normalized):
+            key = re.sub(r"\s+", " ", key_raw).strip(" -.;,")
+            value = re.sub(r"\s+", " ", value_raw).strip(" -.;,")
+            if not key or not value:
+                continue
+            if len(value) < 2 or len(value) > 400:
+                continue
+
+            key_norm = self._normalize_col_name(key)
+            if not key_norm:
+                continue
+
+            # Address values in scanned/tabular PDFs often get prematurely
+            # split by title-cased locality tokens. Expand via dedicated span.
+            if "address" in key_norm:
+                address_match = re.search(
+                    r"address\s*:\s*(.+?)(?=\s+(?:regency|province|purpose|objectives?)\s*:|$)",
+                    normalized,
+                    flags=re.I,
+                )
+                if address_match:
+                    expanded = re.sub(r"\s+", " ", address_match.group(1)).strip(" -.;,")
+                    if len(expanded) > len(value):
+                        value = expanded
+
+            dedupe_key = (key_norm, value.lower())
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            row_num += 1
+            records.append(
+                {
+                    "content": f"Page: {page_idx} | Field: {key} | Value: {value}",
+                    "locator": f"Page {page_idx}, Field row {row_num}",
+                    "page_or_row": f"{page_idx}:{row_num}",
+                    "metadata": {
+                        "page": page_idx,
+                        "sheet": f"page_{page_idx}",
+                        "row": row_num,
+                        "columns": [key_norm],
+                        "row_data": {key_norm: value},
+                        "record_type": "table_row",
+                    },
+                }
+            )
+
+        return records
+
     async def parse_pdf(self, path: Path) -> list[dict[str, Any]]:
         reader = PdfReader(str(path))
         records: list[dict[str, Any]] = []
 
         for idx, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            text = self._normalize_pdf_text(text)
+            raw_text = page.extract_text() or ""
+            table_records = self._extract_pdf_table_records(raw_text, idx)
+            records.extend(table_records)
+            kv_records = self._extract_pdf_kv_records(raw_text, idx)
+            records.extend(kv_records)
+
+            text = self._normalize_pdf_text(raw_text)
             records.append(
                 {
                     "content": text.strip(),

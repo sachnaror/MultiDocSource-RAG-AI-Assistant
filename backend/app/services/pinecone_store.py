@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from typing import Any
 
 import numpy as np
@@ -49,6 +50,17 @@ class PineconeVectorStore(VectorStore):
             )
 
         self._index = self._pc.Index(self._index_name)
+        index_info = self._pc.describe_index(self._index_name)
+        index_dimension = int(index_info.dimension)
+        if self.embedder.dimension != index_dimension:
+            # Keep runtime embedding size aligned with existing Pinecone index.
+            warnings.warn(
+                f"Pinecone index dimension is {index_dimension}, "
+                f"but embedder is {self.embedder.dimension}; aligning embedder to index dimension.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.embedder.dimension = index_dimension
 
     def _namespace(self, source_id: str | None = None) -> str:
         if self._namespace_mode == "per_source" and source_id:
@@ -158,22 +170,36 @@ class PineconeVectorStore(VectorStore):
 
         namespace = self._namespace(source_id)
         filters = {"source_id": {"$eq": source_id}} if source_id else None
+        candidate_k = max(top_k * 6, 12)
 
         response = self._index.query(
             vector=query_vector.tolist(),
-            top_k=top_k,
+            top_k=candidate_k,
             include_metadata=True,
-            include_values=False,
+            include_values=True,
             namespace=namespace,
             filter=filters,
         )
 
         matches = getattr(response, "matches", None) or response.get("matches", [])
-        results: list[SearchResult] = []
+        best_by_content: dict[str, SearchResult] = {}
         for match in matches:
             payload = match.to_dict() if hasattr(match, "to_dict") else match
-            score = float(payload.get("score", 0.0))
             chunk = self._chunk_from_match(payload)
-            results.append(SearchResult(chunk=chunk, similarity=score))
+            pinecone_score = float(payload.get("score", 0.0))
+            if pinecone_score < 0:
+                pinecone_score = max(0.0, min(1.0, (pinecone_score + 1.0) / 2.0))
+            else:
+                pinecone_score = max(0.0, min(1.0, pinecone_score))
 
+            # Blend Pinecone score with local lexical+semantic hybrid for better precision.
+            hybrid_score = self._hybrid_similarity(query, query_vector, chunk)
+            blended = (hybrid_score * 0.75) + (pinecone_score * 0.25)
+            result = SearchResult(chunk=chunk, similarity=blended)
+
+            content_key = " ".join(chunk.content.lower().split())
+            prev = best_by_content.get(content_key)
+            if prev is None or result.similarity > prev.similarity:
+                best_by_content[content_key] = result
+        results = sorted(best_by_content.values(), key=lambda item: item.similarity, reverse=True)
         return results[:top_k]
