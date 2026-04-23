@@ -135,7 +135,7 @@ class MainWindow(QMainWindow):
 
         self.top_k_input = QSpinBox()
         self.top_k_input.setRange(1, 10)
-        self.top_k_input.setValue(1)
+        self.top_k_input.setValue(5)
 
         self.question_input = QPlainTextEdit()
         self.question_input.setPlaceholderText("Ask a factual / analytical / summary question...")

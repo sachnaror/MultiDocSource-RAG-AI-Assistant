@@ -35,10 +35,10 @@ class APIClient:
     def query(
         self,
         question: str,
-        top_k: int = 1,
+        top_k: int = 5,
         chat_history: list[str] | None = None,
         query_mode: str = "auto",
-        response_style: str = "exact",
+        response_style: str = "concise",
     ) -> dict[str, Any]:
         payload = {
             "question": question,
