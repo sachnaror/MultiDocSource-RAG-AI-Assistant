@@ -32,8 +32,21 @@ class APIClient:
         response.raise_for_status()
         return response.json()
 
-    def query(self, question: str, top_k: int = 5, chat_history: list[str] | None = None) -> dict[str, Any]:
-        payload = {"question": question, "top_k": top_k, "chat_history": chat_history or []}
+    def query(
+        self,
+        question: str,
+        top_k: int = 1,
+        chat_history: list[str] | None = None,
+        query_mode: str = "auto",
+        response_style: str = "exact",
+    ) -> dict[str, Any]:
+        payload = {
+            "question": question,
+            "top_k": top_k,
+            "chat_history": chat_history or [],
+            "query_mode": query_mode,
+            "response_style": response_style,
+        }
         response = requests.post(f"{self.base_url}/v1/query", json=payload, timeout=60)
         response.raise_for_status()
         return response.json()

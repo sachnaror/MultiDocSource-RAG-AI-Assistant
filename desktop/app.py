@@ -135,7 +135,7 @@ class MainWindow(QMainWindow):
 
         self.top_k_input = QSpinBox()
         self.top_k_input.setRange(1, 10)
-        self.top_k_input.setValue(5)
+        self.top_k_input.setValue(1)
 
         self.question_input = QPlainTextEdit()
         self.question_input.setPlaceholderText("Ask a factual / analytical / summary question...")
@@ -264,7 +264,11 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            result = self.client.query(question, self.top_k_input.value(), self.chat_history[-5:])
+            result = self.client.query(
+                question=question,
+                top_k=self.top_k_input.value(),
+                chat_history=self.chat_history[-5:],
+            )
             self.answer_output.setPlainText(result["answer"])
             self._render_metrics(result)
             self.chat_history.append(question)
@@ -287,7 +291,10 @@ class MainWindow(QMainWindow):
             f"Tokens -> in: {tokens['input_tokens']}, out: {tokens['output_tokens']}, total: {tokens['total_tokens']}"
         )
         self.metric_confidence.setText(
-            f"Confidence: {result['confidence_score']}% | Query Type: {result['query_type']}"
+            (
+                f"Confidence: {result['confidence_score']}% | Query Type: {result['query_type']} | "
+                f"Mode: {result.get('applied_query_mode', '-')} | Style: {result.get('applied_response_style', '-')}"
+            )
         )
 
         self.embedding_stats.setText(

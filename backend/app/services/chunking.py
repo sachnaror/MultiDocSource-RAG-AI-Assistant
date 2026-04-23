@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.core.config import CHUNK_DENSITY_MULTIPLIER
+
 
 @dataclass
 class ChunkConfig:
     chunk_size: int = 140
     overlap: int = 20
+    density_multiplier: int = CHUNK_DENSITY_MULTIPLIER
 
 
 class Chunker:
@@ -21,7 +24,9 @@ class Chunker:
         size = self.config.chunk_size
         overlap = self.config.overlap
         chunks: list[str] = []
-        step = max(1, size - overlap)
+        base_step = max(1, size - overlap)
+        # Higher density means smaller stride, creating more overlapping chunks.
+        step = max(1, base_step // max(1, self.config.density_multiplier))
 
         for idx in range(0, len(words), step):
             chunk_words = words[idx : idx + size]

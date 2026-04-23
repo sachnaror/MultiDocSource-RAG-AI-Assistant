@@ -69,6 +69,8 @@ class DebugPanel(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     query_type: Literal["factual", "analytical", "summary"]
+    applied_query_mode: Literal["auto", "strict_lookup", "table_only", "rag_generate"]
+    applied_response_style: Literal["exact", "concise", "detailed", "analyst"]
     confidence_score: float
     retrieval_metrics: RetrievalMetrics
     token_usage: TokenUsage
@@ -81,8 +83,10 @@ class QueryResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=3)
-    top_k: int = Field(default=5, ge=1, le=10)
+    top_k: int = Field(default=1, ge=1, le=10)
     chat_history: list[str] = Field(default_factory=list)
+    query_mode: Literal["auto", "strict_lookup", "table_only", "rag_generate"] = "auto"
+    response_style: Literal["exact", "concise", "detailed", "analyst"] = "exact"
 
 
 class DocumentStats(BaseModel):

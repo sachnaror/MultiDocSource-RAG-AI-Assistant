@@ -6,6 +6,7 @@ from statistics import mean
 
 import httpx
 
+from app.core.guardrails import STYLE_PROFILES, normalize_query_mode, normalize_response_style
 from app.core.config import (
     CONFIDENCE_MODE,
     EMBEDDING_DIMENSION,
@@ -147,6 +148,30 @@ class RAGService:
             max_lines = max(max_lines, 8)
 
         return max_words, max_lines, concise
+
+    def _apply_style_profile(self, question: str, response_style: str) -> tuple[int, int, bool, bool, str]:
+        max_words, max_lines, concise = self._parse_constraints(question)
+        style_key = normalize_response_style(response_style)
+        profile = STYLE_PROFILES[style_key]
+
+        if style_key == "exact":
+            max_words = min(max_words, profile.max_words)
+            max_lines = min(max_lines, profile.max_lines)
+            concise = True
+        elif style_key == "concise":
+            max_words = min(max_words, profile.max_words)
+            max_lines = min(max_lines, profile.max_lines)
+            concise = True
+        elif style_key == "detailed":
+            max_words = max(max_words, profile.max_words)
+            max_lines = max(max_lines, profile.max_lines)
+            concise = False
+        elif style_key == "analyst":
+            max_words = min(max(max_words, 80), profile.max_words)
+            max_lines = min(max(max_lines, 4), profile.max_lines)
+            concise = False
+
+        return max_words, max_lines, concise, profile.include_source_default, profile.llm_instruction
 
     def _apply_constraints(self, text: str, max_words: int, max_lines: int) -> str:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -343,12 +368,14 @@ class RAGService:
             stop.update(requested_column.split())
         return [t for t in tokens if t not in stop]
 
-    def _table_direct_answer(self, question: str) -> tuple[str | None, bool]:
+    def _table_direct_answer(self, question: str, force_strict: bool | None = None) -> tuple[str | None, bool]:
         excel_chunks = self._excel_chunks()
         if not excel_chunks:
             return None, False
 
         strict_mode = (TABLE_LOOKUP_MODE or "strict").strip().lower() == "strict"
+        if force_strict is not None:
+            strict_mode = force_strict
         is_table_query = self._is_table_query(question)
 
         has_structured_rows = any(
@@ -477,11 +504,78 @@ class RAGService:
         q = re.sub(r"\s+", " ", q).strip()
         return q
 
-    def _extract_field_value(self, question: str, results: list) -> str | None:
+    def _is_field_lookup_query(self, question: str) -> bool:
         q = question.lower()
-        if "only" not in q and "just" not in q:
+        if any(tok in q for tok in ["exact", "value", "address", "email", "phone", "id", "location"]):
+            return True
+        return bool(re.search(r"\bwhat\s+is\s+.+\bof\b.+", q))
+
+    def _field_target_terms(self, question: str) -> set[str]:
+        cleaned = self._requested_key(question)
+        terms = re.findall(r"[a-zA-Z]{2,}", cleaned)
+        stop = {"of", "for", "and", "with", "from", "that", "this", "company"}
+        return {t for t in terms if t not in stop}
+
+    def _global_pdf_field_lookup(self, question: str) -> str | None:
+        if not self._is_field_lookup_query(question):
             return None
 
+        target_terms = self._field_target_terms(question)
+        wants_address = "address" in target_terms or "location" in target_terms
+        if not wants_address:
+            return None
+
+        chunks = [c for c in self.registry.all_chunks() if c.source_type == "pdf"]
+        if not chunks:
+            return None
+
+        best_value: str | None = None
+        best_score = 0.0
+
+        pattern = re.compile(
+            r"(?:registered\s+address|address)\s*:\s*(.+?)(?=\s+(?:purpose|official|structure|name\s+position|7\s+|6\s+)|$)",
+            flags=re.I,
+        )
+
+        for chunk in chunks:
+            text = self._clean_text(chunk.content)
+            for m in pattern.finditer(text):
+                candidate = re.sub(r"\s+", " ", m.group(1)).strip(" -.;,")
+                if not candidate:
+                    continue
+                low = candidate.lower()
+                score = 2.0
+                if any(tok in low for tok in ["street", "st", "road", "building", "city", "jakarta", "province"]):
+                    score += 2.0
+                if 4 <= len(candidate.split()) <= 40:
+                    score += 1.0
+                if score > best_score:
+                    best_score = score
+                    best_value = candidate
+
+        return best_value
+
+    def _rerank_results_for_field_lookup(self, question: str, results: list) -> list:
+        target_terms = self._field_target_terms(question)
+        if not target_terms:
+            return results
+
+        def score(item) -> float:
+            text = self._clean_text(item.chunk.content).lower()
+            pattern_hits = text.count(":")
+            term_hits = sum(1 for t in target_terms if t in text)
+            exact_key_like = 1.0 if any(f"{t}:" in text for t in target_terms) else 0.0
+            return (term_hits * 3.0) + (pattern_hits * 0.2) + exact_key_like + float(item.similarity)
+
+        ranked = sorted(results, key=score, reverse=True)
+        return ranked
+
+    def _extract_field_value(self, question: str, results: list) -> str | None:
+        q = question.lower()
+        if "only" not in q and "just" not in q and not self._is_field_lookup_query(question):
+            return None
+
+        results = self._rerank_results_for_field_lookup(question, results)
         target = self._requested_key(question)
         if len(target) < 3:
             return None
@@ -492,7 +586,8 @@ class RAGService:
         )
 
         best_value: str | None = None
-        best_score = 0
+        best_score = 0.0
+        target_terms = self._field_target_terms(question)
 
         for item in results:
             text = self._clean_text(item.chunk.content)
@@ -502,17 +597,28 @@ class RAGService:
                 if not value_n:
                     continue
 
-                target_terms = set(target.split())
                 key_terms = set(key_n.split())
-                score = len(target_terms.intersection(key_terms))
+                score = float(len(target_terms.intersection(key_terms)))
 
                 if target in key_n:
                     score += 3
+                if any(term in key_n for term in target_terms):
+                    score += 1.5
+                # Prefer concise values for exact field lookup.
+                word_len = len(value_n.split())
+                if 1 <= word_len <= 12:
+                    score += 0.8
+                if "address" in target_terms and any(tok in value_n.lower() for tok in ["road", "street", "st", "ave", "city", "india", "usa"]):
+                    score += 1.2
                 if score > best_score:
                     best_score = score
                     best_value = value_n
 
         if best_score <= 0 or not best_value:
+            return None
+
+        max_words_allowed = 40 if "address" in target_terms else 14
+        if len(best_value.split()) > max_words_allowed:
             return None
 
         # Return only the value when user asks for "only".
@@ -618,6 +724,7 @@ class RAGService:
         max_words: int,
         max_lines: int,
         concise: bool,
+        style_instruction: str,
     ) -> str | None:
         if not OPENAI_API_KEY:
             return None
@@ -644,6 +751,7 @@ class RAGService:
                 "- Stay grounded strictly in provided context.",
                 "- Explain meaning clearly in plain language.",
                 "- Prefer a single short paragraph unless user asks for detail.",
+                f"- Style guardrail: {style_instruction}",
                 brevity_block,
                 "Context:",
                 "\n".join(context_lines),
@@ -701,10 +809,19 @@ class RAGService:
 
         return None
 
-    def ask(self, question: str, top_k: int, chat_history: list[str] | None = None) -> QueryResponse:
+    def ask(
+        self,
+        question: str,
+        top_k: int,
+        chat_history: list[str] | None = None,
+        query_mode: str = "auto",
+        response_style: str = "concise",
+    ) -> QueryResponse:
         started = time.perf_counter()
         self.registry.counters.total_queries += 1
         chat_history = chat_history or []
+        normalized_mode = normalize_query_mode(query_mode)
+        normalized_style = normalize_response_style(response_style)
 
         retrieval_start = time.perf_counter()
         results = self.store.search(question, self.registry.all_chunks(), top_k=top_k)
@@ -716,6 +833,8 @@ class RAGService:
             return QueryResponse(
                 answer="I could not retrieve relevant information. Please ingest a document first.",
                 query_type=self._detect_query_type(question),
+                applied_query_mode=normalized_mode,
+                applied_response_style=normalized_style,
                 confidence_score=0.0,
                 retrieval_metrics=RetrievalMetrics(top_k=top_k, similarity_scores=[], avg_similarity_score=0.0),
                 token_usage=TokenUsage(input_tokens=self._estimate_tokens(question), output_tokens=12, total_tokens=12 + self._estimate_tokens(question)),
@@ -733,8 +852,8 @@ class RAGService:
         query_type = self._detect_query_type(question)
         top_source_hint = self._citation_line(results[0])
         resolved_question = self._resolve_question(question, chat_history, top_source_hint)
-        max_words, max_lines, concise = self._parse_constraints(question)
-        include_source = self._wants_source_in_answer(question)
+        max_words, max_lines, concise, include_source_default, style_instruction = self._apply_style_profile(question, normalized_style)
+        include_source = include_source_default or self._wants_source_in_answer(question)
 
         raw_similarities = [item.similarity for item in results]
         similarities = [round(score, 4) for score in raw_similarities]
@@ -742,18 +861,36 @@ class RAGService:
         context = "\n\n".join([f"[{self._citation_line(item)}] {self._clean_text(item.chunk.content)}" for item in results])
 
         llm_start = time.perf_counter()
-        answer: str | None
-        table_answer, table_strict_block = self._table_direct_answer(question)
-        answer = table_answer
-        if answer:
-            answer = self._apply_constraints(answer, max_words=max_words, max_lines=max_lines)
+        answer: str | None = None
+        table_strict_block = False
 
-        if not answer and not table_strict_block:
+        if normalized_mode in {"auto", "strict_lookup"}:
+            answer = self._global_pdf_field_lookup(question)
+            if answer:
+                answer = self._apply_constraints(answer, max_words=max_words, max_lines=max_lines)
+
+        if normalized_mode in {"auto", "strict_lookup", "table_only"}:
+            force_strict = normalized_mode in {"strict_lookup", "table_only"}
+            table_answer, table_strict_block = self._table_direct_answer(question, force_strict=force_strict)
+            if not answer and table_answer:
+                answer = table_answer
+                answer = self._apply_constraints(answer, max_words=max_words, max_lines=max_lines)
+
+        if not answer and normalized_mode in {"auto", "strict_lookup"}:
             answer = self._extract_field_value(question, results)
-        if answer:
-            answer = self._apply_constraints(answer, max_words, max_lines)
+            if answer:
+                answer = self._apply_constraints(answer, max_words, max_lines)
 
-        if not answer and not table_strict_block:
+        # For exact field-style questions, avoid vague generative fallback.
+        if not answer and normalized_mode == "auto" and self._is_field_lookup_query(question):
+            answer = self._apply_constraints(STRICT_LOOKUP_FAIL_MESSAGE, max_words=max_words, max_lines=max_lines)
+            table_strict_block = True
+
+        if not answer and normalized_mode in {"strict_lookup", "table_only"}:
+            answer = self._apply_constraints(STRICT_LOOKUP_FAIL_MESSAGE, max_words=max_words, max_lines=max_lines)
+            table_strict_block = True
+
+        if not answer and normalized_mode in {"auto", "rag_generate"} and not table_strict_block:
             answer = self._generate_llm_answer(
                 question=question,
                 resolved_question=resolved_question,
@@ -761,13 +898,21 @@ class RAGService:
                 max_words=max_words,
                 max_lines=max_lines,
                 concise=concise,
+                style_instruction=style_instruction,
             )
-        if not answer and not table_strict_block:
+
+        if not answer and normalized_mode in {"auto", "rag_generate"} and not table_strict_block:
             if concise:
                 answer = self._local_short_answer(question, results, max_words, max_lines, include_source=include_source)
             else:
                 answer = self._generate_local_refined_answer(question, resolved_question, results, query_type)
-        if not answer and not table_strict_block and self._is_small_info_request(question):
+
+        if (
+            not answer
+            and normalized_mode in {"auto", "rag_generate"}
+            and not table_strict_block
+            and self._is_small_info_request(question)
+        ):
             answer = self._local_short_answer(question, results, max_words=min(max_words, 20), max_lines=1, include_source=False)
         llm_response_time_ms = (time.perf_counter() - llm_start) * 1000
 
@@ -781,6 +926,8 @@ class RAGService:
         return QueryResponse(
             answer=answer,
             query_type=query_type,
+            applied_query_mode=normalized_mode,
+            applied_response_style=normalized_style,
             confidence_score=round(confidence * 100, 2),
             retrieval_metrics=RetrievalMetrics(top_k=top_k, similarity_scores=similarities, avg_similarity_score=avg_similarity),
             token_usage=TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=input_tokens + output_tokens),

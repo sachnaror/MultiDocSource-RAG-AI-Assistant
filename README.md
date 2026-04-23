@@ -49,6 +49,25 @@ In `TABLE_LOOKUP_MODE=strict`:
 - exact answer not found -> return explicit not-found message
 - avoids vague LLM fallback for table-style questions
 
+### Query Mode And Response Style
+
+Each query can explicitly control routing and answer persona:
+
+- `query_mode`
+- `auto`: deterministic lookup first, then RAG/generation fallback
+- `strict_lookup`: deterministic extraction only
+- `table_only`: deterministic table extraction only
+- `rag_generate`: generation-first flow (no strict lookup block)
+
+- `response_style`
+- `exact`: one-line direct value/answer
+- `concise`: short plain-language answer
+- `detailed`: fuller explanation
+- `analyst`: evidence-oriented concise answer
+
+Guardrail profile definitions are in:
+- [guardrails.py](backend/app/core/guardrails.py)
+
 ## Project Structure
 
 ```text
@@ -58,7 +77,8 @@ MultiDocSource-RAG-AI-Assistant/
 │       ├── api/
 │       │   └── routes.py
 │       ├── core/
-│       │   └── config.py
+│       │   ├── config.py
+│       │   └── guardrails.py
 │       ├── models/
 │       │   └── schemas.py
 │       ├── services/
@@ -109,6 +129,7 @@ Optional:
 - `EMBEDDING_REQUEST_TIMEOUT_SEC` (default `20`)
 - `REASONING_EFFORT` (default `high`)
 - `STRICT_LOOKUP_FAIL_MESSAGE` (custom strict-mode not-found text)
+- Per-query options are passed in request body: `query_mode`, `response_style`
 
 ## Run Backend
 
@@ -143,6 +164,18 @@ source .venv/bin/activate
 - `POST /v1/query` - ask a question
 - `GET /v1/sources` - list indexed sources
 - `GET /v1/dashboard` - summary metrics
+
+Example `/v1/query` payload:
+
+```json
+{
+  "question": "What is value in row 4 column revenue?",
+  "top_k": 2,
+  "chat_history": [],
+  "query_mode": "strict_lookup",
+  "response_style": "exact"
+}
+```
 
 ## Query Behavior
 
@@ -202,5 +235,5 @@ Action:
 ## Next Recommended Improvements
 
 1. Add persistent vector store (e.g., pgvector or Pinecone).
-2. Add explicit query mode selector (`strict_lookup` vs `rag_generate`).
-3. Add ingestion versioning + automatic stale-index warning.
+2. Add dataset-aware schema extraction for richer table joins across sheets.
+3. Add ingestion versioning plus automatic stale-index warning.
