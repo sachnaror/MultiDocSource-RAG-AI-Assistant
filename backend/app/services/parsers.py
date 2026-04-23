@@ -126,28 +126,34 @@ class ParserService:
         if not normalized:
             return []
 
-        # Capture table/form-like "Field: Value" spans on each page.
-        # Keep label detection strict to avoid chopping values that contain
-        # title-cased phrases (for example long addresses).
-        label_boundary = r"(?:[A-Z][A-Za-z0-9()/_&.'-]*\s*){1,3}"
-        pattern = re.compile(
-            rf"([A-Z][A-Za-z0-9 ()/&._'-]{{2,70}}?)\s*:\s*(.+?)(?=\s+{label_boundary}:|$)"
+        # Position-based extraction is more robust than boundary lookaheads for
+        # chained form fields like: "Transaction Type: ... Name of the Notary: ..."
+        label_pattern = re.compile(
+            r"(?<!\w)([A-Z][A-Za-z0-9()/_&.'-]*(?:\s+[A-Za-z0-9()/_&.'-]+){0,4})\s*:"
         )
+        matches = list(label_pattern.finditer(normalized))
+        if not matches:
+            return []
 
         records: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         row_num = 0
 
-        for key_raw, value_raw in pattern.findall(normalized):
-            key = re.sub(r"\s+", " ", key_raw).strip(" -.;,")
-            value = re.sub(r"\s+", " ", value_raw).strip(" -.;,")
+        for idx, match in enumerate(matches):
+            key_raw = match.group(1)
+            value_start = match.end()
+            value_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(normalized)
+
+            key = re.sub(r"(?<=[A-Za-z])\d+\b", "", key_raw)
+            key = re.sub(r"\s+", " ", key).strip(" -.;,")
+            value = re.sub(r"\s+", " ", normalized[value_start:value_end]).strip(" -.;,")
             if not key or not value:
                 continue
             if len(value) < 2 or len(value) > 400:
                 continue
 
             key_norm = self._normalize_col_name(key)
-            if not key_norm:
+            if not key_norm or not re.search(r"[a-z]", key_norm):
                 continue
 
             # Address values in scanned/tabular PDFs often get prematurely
