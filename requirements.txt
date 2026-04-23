@@ -11,3 +11,4 @@ PyQt6==6.9.1
 requests==2.32.4
 langgraph==0.2.56
 pinecone==5.4.2
+python-dotenv==1.0.1
