@@ -1,0 +1,11 @@
+fastapi==0.116.1
+uvicorn==0.35.0
+python-multipart==0.0.20
+pydantic==2.11.7
+pandas==2.3.1
+openpyxl==3.1.5
+pypdf==5.9.0
+httpx==0.28.1
+numpy==2.3.2
+PyQt6==6.9.1
+requests==2.32.4
