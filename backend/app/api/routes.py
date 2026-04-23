@@ -60,7 +60,7 @@ async def get_job(job_id: str) -> JobStatusResponse:
 @router.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest) -> QueryResponse:
     rag = RAGService(store=job_manager.vector_store, registry=registry)
-    return rag.ask(request.question, request.top_k)
+    return rag.ask(request.question, request.top_k, request.chat_history)
 
 
 @router.get("/sources", response_model=list[SourceSummary])

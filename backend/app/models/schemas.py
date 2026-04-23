@@ -82,6 +82,7 @@ class QueryResponse(BaseModel):
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=3)
     top_k: int = Field(default=5, ge=1, le=10)
+    chat_history: list[str] = Field(default_factory=list)
 
 
 class DocumentStats(BaseModel):
