@@ -495,6 +495,20 @@ class RAGService:
                 return STRICT_LOOKUP_FAIL_MESSAGE, True
             return None, False
 
+        # Entity-focused direct value extraction for table/form fields.
+        if "notary" in q:
+            for key, value in row_data.items():
+                key_n = self._normalize_key(str(key))
+                if "notary" in key_n and isinstance(value, str) and value.strip():
+                    cleaned = re.split(
+                        r"\b(?:domicile\s+of\s+the|deed\s+date|regency|province)\b",
+                        value,
+                        maxsplit=1,
+                        flags=re.I,
+                    )[0].strip(" -.;,")
+                    if cleaned:
+                        return cleaned, False
+
         # If no specific requested column, return the most relevant fields only.
         compact_pairs = []
         for key, value in row_data.items():
@@ -526,13 +540,215 @@ class RAGService:
         q = question.lower()
         if any(tok in q for tok in ["exact", "value", "address", "email", "phone", "id", "location"]):
             return True
+        if any(tok in q for tok in ["notary", "name of", "who is", "what is the name"]):
+            return True
         return bool(re.search(r"\bwhat\s+is\s+.+\bof\b.+", q))
+
+    def _entity_hint(self, question: str) -> str | None:
+        q = question.lower().strip()
+        if "notary" in q:
+            return "notary"
+        match = re.search(r"(?:name\s+of|who\s+is|what\s+is\s+the\s+name\s+of)\s+(?:the\s+)?([a-z0-9 _-]{2,40})", q)
+        if match:
+            entity = re.sub(r"\s+", " ", match.group(1)).strip()
+            return entity
+        return None
+
+    def _entity_field_lookup(self, question: str, results: list) -> str | None:
+        entity = self._entity_hint(question)
+        if not entity:
+            return None
+
+        def _clean_entity_value(ent: str, value: str) -> str:
+            cleaned = re.sub(r"\s+", " ", value).strip(" -.;,")
+            if ent == "notary":
+                cleaned = re.split(
+                    r"\b(?:domicile\s+of\s+the|deed\s+date|regency|province)\b",
+                    cleaned,
+                    maxsplit=1,
+                    flags=re.I,
+                )[0].strip(" -.;,")
+            return cleaned
+
+        # First pass: structured row_data from table-aware records in the same
+        # source as the top retrieval hit to reduce cross-document noise.
+        target_source_id = results[0].chunk.source_id if results else None
+        source_chunks = self.registry.all_chunks()
+        if target_source_id:
+            source_chunks = [c for c in source_chunks if c.source_id == target_source_id]
+
+        best_value: str | None = None
+        best_score = -1.0
+        for chunk in source_chunks:
+            row_data = chunk.metadata.get("row_data", {})
+            if not isinstance(row_data, dict) or not row_data:
+                continue
+            for key, value in row_data.items():
+                key_n = self._normalize_key(str(key))
+                val = str(value).strip()
+                if not val:
+                    continue
+                score = 0.0
+                if entity in key_n:
+                    score += 3.0
+                if "name" in key_n:
+                    score += 1.0
+                if entity in val.lower():
+                    score -= 0.5
+                if score > best_score:
+                    best_score = score
+                    best_value = _clean_entity_value(entity, val)
+
+        if best_value and best_score >= 2.0:
+            return best_value
+
+        # Second pass: explicit text labels in retrieved chunks.
+        context = " ".join(self._clean_text(item.chunk.content) for item in results[:5])
+        if entity == "notary":
+            pattern = re.compile(
+                r"(?:name\s+of\s+the\s+notary|notary(?:\s+name)?)\s*:\s*([A-Za-z][A-Za-z .'-]{2,120})",
+                flags=re.I,
+            )
+            m = pattern.search(context)
+            if m:
+                value = _clean_entity_value(entity, m.group(1))
+                if value:
+                    return value
+
+        generic = re.search(
+            rf"(?:name\s+of\s+the\s+{re.escape(entity)}|{re.escape(entity)}\s+name)\s*:\s*([A-Za-z][A-Za-z .'-]{{2,120}})",
+            context,
+            flags=re.I,
+        )
+        if generic:
+            value = _clean_entity_value(entity, generic.group(1))
+            if value:
+                return value
+
+        return None
 
     def _field_target_terms(self, question: str) -> set[str]:
         cleaned = self._requested_key(question)
         terms = re.findall(r"[a-zA-Z]{2,}", cleaned)
         stop = {"of", "for", "and", "with", "from", "that", "this", "company"}
         return {t for t in terms if t not in stop}
+
+    @staticmethod
+    def _primary_source_id(results: list) -> str | None:
+        if not results:
+            return None
+        scores: dict[str, float] = {}
+        for item in results[:8]:
+            src = item.chunk.source_id
+            scores[src] = scores.get(src, 0.0) + float(item.similarity)
+        if not scores:
+            return None
+        return max(scores, key=scores.get)
+
+    def _source_wide_field_lookup(self, question: str, results: list) -> str | None:
+        if not results:
+            return None
+        source_id = self._primary_source_id(results)
+        if not source_id:
+            return None
+        source_chunks = [c for c in self.registry.all_chunks() if c.source_id == source_id]
+        if not source_chunks:
+            return None
+
+        text = " ".join(self._clean_text(c.content) for c in source_chunks)
+        q = question.lower()
+
+        def _clean_name(val: str) -> str:
+            val = re.sub(r"\s+", " ", val).strip(" -.;,")
+            val = re.split(
+                r"\b(?:domicile\s+of\s+the|deed\s+date|regency|province|address|purpose|objectives?)\b",
+                val,
+                maxsplit=1,
+                flags=re.I,
+            )[0].strip(" -.;,")
+            return val
+
+        if "notary" in q:
+            m = re.search(
+                r"(?:name\s+of\s+the\s+notary|notary(?:\s+name)?|notary\s+data(?:\s+name\s+of\s+the\s+notary)?)\s*:\s*([A-Z][A-Za-z .'-]{5,140})",
+                text,
+                flags=re.I,
+            )
+            if m:
+                value = _clean_name(m.group(1))
+                if value and len(value.split()) >= 2:
+                    return value
+
+        if "phone" in q:
+            m = re.search(r"(?:phone(?:\s+number)?)\s*:\s*([+0-9][0-9+\-\s]{5,30})", text, flags=re.I)
+            if m:
+                return re.sub(r"\s+", "", m.group(1)).strip(" -.;,")
+
+        if "address" in q:
+            m = re.search(
+                r"(?:registered\s+address|address)\s*:\s*(.+?)(?=\s+(?:regency|province|purpose|objectives?)\s*:|$)",
+                text,
+                flags=re.I,
+            )
+            if m:
+                value = re.sub(r"\s+", " ", m.group(1)).strip(" -.;,")
+                if value:
+                    return value
+
+        if "purpose" in q:
+            m = re.search(r"Purposes?\s*:\s*(.+?)(?=\s+Objectives?\s*:|$)", text, flags=re.I)
+            if m:
+                return re.sub(r"\s+", " ", m.group(1)).strip(" -.;,")
+
+        if "objective" in q:
+            m = re.search(
+                r"Objectives?\s*:\s*(.+?)(?=\s+(?:Official\s+registered\s+address|Company[’']?s\s+business|$))",
+                text,
+                flags=re.I,
+            )
+            if m:
+                return re.sub(r"\s+", " ", m.group(1)).strip(" -.;,")
+
+        return None
+
+    def _structured_field_lookup(self, question: str, results: list) -> str | None:
+        if not results:
+            return None
+        target_terms = self._field_target_terms(question)
+        if not target_terms:
+            return None
+
+        target_source_id = results[0].chunk.source_id
+        source_chunks = [c for c in self.registry.all_chunks() if c.source_id == target_source_id]
+
+        best_value: str | None = None
+        best_score = 0.0
+        for chunk in source_chunks:
+            row_data = chunk.metadata.get("row_data", {})
+            if not isinstance(row_data, dict) or not row_data:
+                continue
+            for key, value in row_data.items():
+                val = str(value).strip()
+                if not val:
+                    continue
+                key_terms = set(self._normalized_tokens(str(key)))
+                overlap = len(target_terms.intersection(key_terms))
+                if overlap <= 0:
+                    continue
+                score = float(overlap) / max(1, len(key_terms))
+                # Prefer cleaner concise values for factual fields.
+                words = len(val.split())
+                if 1 <= words <= 30:
+                    score += 0.2
+                if any(t in {"purpose", "objectives", "objective"} for t in target_terms) and words > 20:
+                    score += 0.25
+                if score > best_score:
+                    best_score = score
+                    best_value = val
+
+        if best_value and best_score >= 0.4:
+            return best_value
+        return None
 
     def _global_pdf_field_lookup(self, question: str) -> str | None:
         if not self._is_field_lookup_query(question):
@@ -691,6 +907,31 @@ class RAGService:
         span = re.sub(r"\s+", " ", span).strip()
         return self._apply_constraints(span, max_words=max_words, max_lines=1)
 
+    def _answer_relevance_score(self, question: str, answer: str) -> float:
+        q_terms = self._question_terms(question)
+        if not q_terms:
+            return 1.0 if answer.strip() else 0.0
+        a_terms = set(re.findall(r"[a-zA-Z0-9]{2,}", answer.lower()))
+        overlap = len(q_terms.intersection(a_terms))
+        return overlap / max(1, len(q_terms))
+
+    def _looks_vague_for_query(self, question: str, answer: str) -> bool:
+        if not answer or not answer.strip():
+            return True
+        low = answer.lower().strip()
+        vague_markers = [
+            "the section mainly states",
+            "based on the provided context",
+            "this document",
+            "it appears",
+        ]
+        if any(marker in low for marker in vague_markers):
+            return True
+        # Very short factual questions should not get long generic blurbs.
+        if self._is_small_info_request(question) and len(low.split()) > 60:
+            return True
+        return self._answer_relevance_score(question, answer) < 0.12
+
     def _local_short_answer(
         self,
         question: str,
@@ -841,7 +1082,9 @@ class RAGService:
         chat_history = chat_history or []
         normalized_mode = normalize_query_mode(query_mode)
         normalized_style = normalize_response_style(response_style)
-        if self._is_small_info_request(question):
+        if self._is_field_lookup_query(question):
+            top_k = max(top_k, 6)
+        elif self._is_small_info_request(question):
             top_k = min(top_k, 3)
 
         retrieval_start = time.perf_counter()
@@ -893,6 +1136,21 @@ class RAGService:
             if answer:
                 answer = self._apply_constraints(answer, max_words=max_words, max_lines=max_lines)
 
+        if not answer and normalized_mode in {"auto", "strict_lookup"}:
+            answer = self._entity_field_lookup(question, results)
+            if answer:
+                answer = self._apply_constraints(answer, max_words=max_words, max_lines=max_lines)
+
+        if not answer and normalized_mode in {"auto", "strict_lookup"}:
+            answer = self._structured_field_lookup(question, results)
+            if answer:
+                answer = self._apply_constraints(answer, max_words=max_words, max_lines=max_lines)
+
+        if not answer and normalized_mode in {"auto", "strict_lookup"}:
+            answer = self._source_wide_field_lookup(question, results)
+            if answer:
+                answer = self._apply_constraints(answer, max_words=max_words, max_lines=max_lines)
+
         if normalized_mode in {"auto", "strict_lookup", "table_only"}:
             force_strict = normalized_mode in {"strict_lookup", "table_only"}
             table_answer, table_strict_block = self._table_direct_answer(question, force_strict=force_strict)
@@ -939,6 +1197,13 @@ class RAGService:
             and self._is_small_info_request(question)
         ):
             answer = self._local_short_answer(question, results, max_words=min(max_words, 20), max_lines=1, include_source=False)
+
+        # Final anti-vague guard: if answer doesn't align with the question,
+        # force deterministic source-wide lookup once before returning.
+        if answer and self._looks_vague_for_query(question, answer):
+            deterministic = self._structured_field_lookup(question, results) or self._source_wide_field_lookup(question, results)
+            if deterministic:
+                answer = self._apply_constraints(deterministic, max_words=max_words, max_lines=max_lines)
         llm_response_time_ms = (time.perf_counter() - llm_start) * 1000
 
         all_chunk_lengths = [len(c.content.split()) for c in self.registry.all_chunks()]

@@ -98,10 +98,7 @@ class ParserService:
                     row_num += 1
                     records.append(
                         {
-                            "content": (
-                                f"Page: {page_idx} | TableRow: {row_num} | "
-                                + " | ".join(parts)
-                            ),
+                            "content": " | ".join(parts),
                             "locator": f"Page {page_idx}, Table row {row_num}",
                             "page_or_row": f"{page_idx}:{row_num}",
                             "metadata": {
@@ -129,7 +126,7 @@ class ParserService:
         # Position-based extraction is more robust than boundary lookaheads for
         # chained form fields like: "Transaction Type: ... Name of the Notary: ..."
         label_pattern = re.compile(
-            r"(?<!\w)([A-Z][A-Za-z0-9()/_&.'-]*(?:\s+[A-Za-z0-9()/_&.'-]+){0,4})\s*:"
+            r"(?<!\w)([A-Z][A-Za-z0-9()/_&'-]*(?:\s+[A-Za-z0-9()/_&'-]+){0,4})\s*:"
         )
         matches = list(label_pattern.finditer(normalized))
         if not matches:
@@ -146,6 +143,7 @@ class ParserService:
 
             key = re.sub(r"(?<=[A-Za-z])\d+\b", "", key_raw)
             key = re.sub(r"\s+", " ", key).strip(" -.;,")
+            key = re.sub(r"^\s*data\s+", "", key, flags=re.I)
             value = re.sub(r"\s+", " ", normalized[value_start:value_end]).strip(" -.;,")
             if not key or not value:
                 continue
@@ -155,6 +153,17 @@ class ParserService:
             key_norm = self._normalize_col_name(key)
             if not key_norm or not re.search(r"[a-z]", key_norm):
                 continue
+
+            # Guard against OCR-merged labels bleeding into values.
+            if key_norm == "transaction type":
+                value = re.split(r"\b(?:notary\s+data|name\s+of\s+the)\b", value, maxsplit=1, flags=re.I)[0].strip(" -.;,")
+            if "notary" in key_norm:
+                value = re.split(
+                    r"\b(?:domicile\s+of\s+the|deed\s+date|regency|province)\b",
+                    value,
+                    maxsplit=1,
+                    flags=re.I,
+                )[0].strip(" -.;,")
 
             # Address values in scanned/tabular PDFs often get prematurely
             # split by title-cased locality tokens. Expand via dedicated span.
@@ -177,7 +186,7 @@ class ParserService:
             row_num += 1
             records.append(
                 {
-                    "content": f"Page: {page_idx} | Field: {key} | Value: {value}",
+                    "content": f"Field: {key} | Value: {value}",
                     "locator": f"Page {page_idx}, Field row {row_num}",
                     "page_or_row": f"{page_idx}:{row_num}",
                     "metadata": {
@@ -190,6 +199,47 @@ class ParserService:
                     },
                 }
             )
+
+        # Add strong captures for long business fields that are often truncated
+        # by OCR/form parsing.
+        def _append_field_if_missing(field_key: str, field_value: str) -> None:
+            nonlocal row_num
+            key_norm = self._normalize_col_name(field_key)
+            val = re.sub(r"\s+", " ", field_value).strip(" -.;,")
+            if not val:
+                return
+            dedupe = (key_norm, val.lower())
+            if dedupe in seen:
+                return
+            seen.add(dedupe)
+            row_num += 1
+            records.append(
+                {
+                    "content": f"Field: {field_key} | Value: {val}",
+                    "locator": f"Page {page_idx}, Field row {row_num}",
+                    "page_or_row": f"{page_idx}:{row_num}",
+                    "metadata": {
+                        "page": page_idx,
+                        "sheet": f"page_{page_idx}",
+                        "row": row_num,
+                        "columns": [key_norm],
+                        "row_data": {key_norm: val},
+                        "record_type": "table_row",
+                    },
+                }
+            )
+
+        purpose_match = re.search(r"Purposes?\s*:\s*(.+?)(?=\s+Objectives?\s*:|$)", normalized, flags=re.I)
+        if purpose_match:
+            _append_field_if_missing("purpose", purpose_match.group(1))
+
+        objective_match = re.search(
+            r"Objectives?\s*:\s*(.+?)(?=\s+(?:Official\s+registered\s+address|Company[’']?s\s+business|$))",
+            normalized,
+            flags=re.I,
+        )
+        if objective_match:
+            _append_field_if_missing("objectives", objective_match.group(1))
 
         return records
 
@@ -236,11 +286,9 @@ class ParserService:
                 if not content:
                     continue
 
-                # Keep explicit table semantics in content so retrieval understands row/column intent.
-                table_prefix = f"Sheet: {sheet_name} | Row: {row_idx} | "
                 records.append(
                     {
-                        "content": f"{table_prefix}{content}",
+                        "content": content,
                         "locator": f"Sheet {sheet_name}, Row {row_idx}",
                         "page_or_row": f"{sheet_name}:{row_idx}",
                         "metadata": {
