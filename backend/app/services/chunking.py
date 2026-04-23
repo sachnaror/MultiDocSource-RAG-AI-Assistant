@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 @dataclass
 class ChunkConfig:
-    chunk_size: int = 450
-    overlap: int = 80
+    chunk_size: int = 140
+    overlap: int = 20
 
 
 class Chunker:

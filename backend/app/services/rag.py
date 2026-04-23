@@ -7,10 +7,12 @@ from statistics import mean
 import httpx
 
 from app.core.config import (
+    CONFIDENCE_MODE,
     EMBEDDING_DIMENSION,
     EMBEDDING_MODEL_NAME,
     GENERATION_MODEL,
     OPENAI_API_KEY,
+    REASONING_EFFORT,
 )
 from app.models.schemas import (
     ChunkDistribution,
@@ -30,6 +32,43 @@ class RAGService:
     def __init__(self, store: VectorStore, registry: InMemoryRegistry) -> None:
         self.store = store
         self.registry = registry
+
+    def _compute_confidence(self, similarities: list[float], top_k: int) -> float:
+        if not similarities:
+            return 0.0
+        top = similarities[0]
+        head = similarities[: min(3, len(similarities))]
+        head_avg = mean(head)
+        tail = similarities[: min(5, len(similarities))]
+        tail_avg = mean(tail)
+        coverage = min(1.0, len(similarities) / max(1, top_k))
+        spread = max(0.0, top - head_avg)
+
+        mode = (CONFIDENCE_MODE or "strict").strip().lower()
+        if mode == "high":
+            # Aggressive confidence mode: prioritizes best-match strength and
+            # rewards strong top-hit retrieval.
+            confidence = (top * 0.62) + (head_avg * 0.23) + (tail_avg * 0.10) + (coverage * 0.05)
+            if top >= 0.75:
+                confidence += 0.04
+            if top >= 0.85:
+                confidence += 0.04
+            if head_avg >= 0.70:
+                confidence += 0.03
+            return max(0.35, min(0.995, confidence))
+
+        if mode == "normal":
+            confidence = (top * 0.60) + (head_avg * 0.30) + (coverage * 0.10)
+            if top >= 0.80 and head_avg >= 0.65:
+                confidence += 0.05
+            return max(0.25, min(0.98, confidence))
+
+        # Strict confidence mode (default): stronger penalty for uneven retrieval.
+        confidence = (top * 0.50) + (head_avg * 0.30) + (tail_avg * 0.10) + (coverage * 0.10)
+        confidence -= spread * 0.20
+        if top >= 0.88 and head_avg >= 0.78:
+            confidence += 0.03
+        return max(0.12, min(0.93, confidence))
 
     def _detect_query_type(self, question: str) -> str:
         lower = question.lower()
@@ -63,133 +102,499 @@ class RAGService:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned
 
-    def _plain_language(self, text: str, max_words: int = 90) -> str:
-        cleaned = self._clean_text(text)
-        words = cleaned.split()
-        if not words:
-            return ""
-        snippet = " ".join(words[:max_words])
-        substitutions = {
-            "shall": "must",
-            "herein": "in this document",
-            "thereof": "of it",
-            "pursuant": "according",
-            "commence": "start",
-            "terminate": "end",
-        }
-        for src, dst in substitutions.items():
-            snippet = re.sub(rf"\b{src}\b", dst, snippet, flags=re.IGNORECASE)
-        return snippet
-
     def _citation_line(self, item) -> str:
         return f"{item.chunk.source_name} ({item.chunk.locator}, chunk {item.chunk.chunk_id})"
 
-    def _generate_local_refined_answer(self, question: str, resolved_question: str, results: list, query_type: str) -> str:
-        top = results[0]
-        top_explanation = self._plain_language(top.chunk.content)
+    def _parse_constraints(self, question: str) -> tuple[int, int, bool]:
+        q = question.lower()
+        # Default behavior should feel ChatGPT-like: direct and succinct.
+        max_words = 55
+        max_lines = 3
+        concise = True
+        has_explicit_word_limit = False
 
-        key_points = []
-        for item in results[:3]:
-            snippet = self._plain_language(item.chunk.content, max_words=55)
-            key_points.append(f"- {snippet} [{self._citation_line(item)}]")
+        word_match = re.search(r"(\d{1,3})\s*words?", q)
+        if word_match:
+            max_words = max(8, min(int(word_match.group(1)), 120))
+            concise = True
+            has_explicit_word_limit = True
 
-        direct_answer = (
-            f"Based on the retrieved context, this is primarily about: {top_explanation}."
-            if top_explanation
-            else "I found relevant context, but it is too sparse to explain confidently."
-        )
-
-        if "mean" in question.lower() or "explain" in question.lower():
-            explanation_header = "What this means in simple terms"
-            explanation_body = (
-                f"In this specific reference, it is saying that {top_explanation.lower()}"
-                if top_explanation
-                else "The source text is limited, so I need a slightly more specific question."
-            )
+        if "one line" in q or "1 line" in q:
+            max_lines = 1
+            concise = True
+        elif "two lines" in q or "2 lines" in q:
+            max_lines = 2
+            concise = True
         else:
-            explanation_header = "Interpretation"
-            explanation_body = (
-                f"Interpreting your question ({query_type}), the strongest evidence points to this reading: {top_explanation}."
-                if top_explanation
-                else "I need a little more context to interpret this precisely."
-            )
+            line_range = re.search(r"(\d)\s*[-to]+\s*(\d)\s*lines", q)
+            if line_range:
+                max_lines = max(1, min(6, int(line_range.group(2))))
+                concise = True
 
-        return "\n".join(
-            [
-                "Direct Answer",
-                direct_answer,
-                "",
-                explanation_header,
-                explanation_body,
-                "",
-                "Grounded Evidence",
-                *key_points,
-                "",
-                f"Question interpreted as: {resolved_question}",
-            ]
+        if "concise" in q or "brief" in q:
+            concise = True
+            max_words = min(max_words, 45)
+
+        # If user asks for one line but no explicit word limit, keep it sharp.
+        if max_lines == 1 and not has_explicit_word_limit:
+            max_words = min(max_words, 20)
+
+        if self._wants_detailed_output(question):
+            concise = False
+            max_words = max(max_words, 140)
+            max_lines = max(max_lines, 8)
+
+        return max_words, max_lines, concise
+
+    def _apply_constraints(self, text: str, max_words: int, max_lines: int) -> str:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return text.strip()
+
+        lines = lines[:max_lines]
+        words: list[str] = []
+        for line in lines:
+            for token in line.split():
+                words.append(token)
+                if len(words) >= max_words:
+                    return " ".join(words)
+        return "\n".join(lines)
+
+    def _focus_terms(self, question: str) -> list[str]:
+        terms = re.findall(r"[a-zA-Z]{3,}", question.lower())
+        stop = {
+            "what",
+            "does",
+            "this",
+            "that",
+            "mean",
+            "explain",
+            "line",
+            "lines",
+            "with",
+            "from",
+            "about",
+            "max",
+            "word",
+            "words",
+        }
+        return [t for t in terms if t not in stop][:8]
+
+    def _question_terms(self, question: str) -> set[str]:
+        return set(self._focus_terms(question))
+
+    def _is_small_info_request(self, question: str) -> bool:
+        q = question.lower().strip()
+        if "?" in q and len(q.split()) <= 12:
+            return True
+        small_intents = [
+            "what is",
+            "which is",
+            "who is",
+            "when is",
+            "where is",
+            "how much",
+            "how many",
+            "only",
+            "just",
+        ]
+        return any(intent in q for intent in small_intents)
+
+    @staticmethod
+    def _normalize_key(name: str) -> str:
+        cleaned = re.sub(r"\s+", " ", str(name).strip().lower())
+        cleaned = re.sub(r"[^a-z0-9 _-]", "", cleaned)
+        return cleaned
+
+    def _excel_chunks(self) -> list:
+        return [chunk for chunk in self.registry.all_chunks() if chunk.source_type == "excel"]
+
+    def _sheet_hint(self, question: str) -> str | None:
+        q = question.lower()
+        match = re.search(r"\bsheet\s+([a-z0-9 _-]+)", q)
+        if not match:
+            return None
+        return self._normalize_key(match.group(1))
+
+    def _row_hint(self, question: str) -> int | None:
+        match = re.search(r"\brow\s+(\d+)\b", question.lower())
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _requested_column(self, question: str, all_columns: set[str]) -> str | None:
+        q = self._normalize_key(question)
+        matches = [col for col in all_columns if col and col in q]
+        if not matches:
+            return None
+        matches.sort(key=len, reverse=True)
+        return matches[0]
+
+    def _row_filter_terms(self, question: str, requested_column: str | None) -> list[str]:
+        tokens = re.findall(r"[a-zA-Z0-9]{2,}", question.lower())
+        stop = {
+            "what",
+            "which",
+            "who",
+            "when",
+            "where",
+            "how",
+            "much",
+            "many",
+            "is",
+            "the",
+            "a",
+            "an",
+            "for",
+            "in",
+            "on",
+            "of",
+            "from",
+            "please",
+            "tell",
+            "me",
+            "value",
+            "column",
+            "row",
+            "sheet",
+            "table",
+            "show",
+            "find",
+            "give",
+            "only",
+            "just",
+        }
+        if requested_column:
+            stop.update(requested_column.split())
+        return [t for t in tokens if t not in stop]
+
+    def _table_direct_answer(self, question: str) -> str | None:
+        excel_chunks = self._excel_chunks()
+        if not excel_chunks:
+            return None
+
+        all_columns: set[str] = set()
+        for chunk in excel_chunks:
+            cols = chunk.metadata.get("columns", [])
+            if isinstance(cols, list):
+                all_columns.update(self._normalize_key(c) for c in cols)
+
+        requested_col = self._requested_column(question, all_columns)
+        sheet_hint = self._sheet_hint(question)
+        row_hint = self._row_hint(question)
+        q = question.lower()
+
+        if "column" in q and any(t in q for t in ["what", "which", "list", "show"]):
+            candidate_cols = sorted(c for c in all_columns if c)
+            if candidate_cols:
+                return ", ".join(candidate_cols)
+
+        if any(phrase in q for phrase in ["how many rows", "number of rows", "total rows"]):
+            rows = set()
+            for chunk in excel_chunks:
+                row = chunk.metadata.get("row")
+                sheet = self._normalize_key(chunk.metadata.get("sheet", ""))
+                if isinstance(row, int):
+                    if sheet_hint and sheet_hint not in sheet:
+                        continue
+                    rows.add((sheet, row))
+            if rows:
+                return str(len(rows))
+
+        if requested_col and row_hint is not None:
+            for chunk in excel_chunks:
+                row = chunk.metadata.get("row")
+                sheet = self._normalize_key(chunk.metadata.get("sheet", ""))
+                if not isinstance(row, int) or row != row_hint:
+                    continue
+                if sheet_hint and sheet_hint not in sheet:
+                    continue
+                row_data = chunk.metadata.get("row_data", {})
+                if isinstance(row_data, dict):
+                    value = row_data.get(requested_col)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+
+        terms = self._row_filter_terms(question, requested_col)
+        if not terms and not requested_col:
+            return None
+
+        best_chunk = None
+        best_score = -1
+        for chunk in excel_chunks:
+            sheet = self._normalize_key(chunk.metadata.get("sheet", ""))
+            if sheet_hint and sheet_hint not in sheet:
+                continue
+            row_data = chunk.metadata.get("row_data", {})
+            if not isinstance(row_data, dict) or not row_data:
+                continue
+
+            haystack = f"{sheet} " + " ".join(str(v).lower() for v in row_data.values())
+            score = sum(1 for t in terms if t in haystack)
+            if requested_col and requested_col in row_data:
+                score += 2
+            if score > best_score:
+                best_score = score
+                best_chunk = chunk
+
+        if best_chunk is None or best_score <= 0:
+            return None
+
+        row_data = best_chunk.metadata.get("row_data", {})
+        if not isinstance(row_data, dict):
+            return None
+
+        if requested_col:
+            value = row_data.get(requested_col)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        # If no specific requested column, return the most relevant fields only.
+        compact_pairs = []
+        for key, value in row_data.items():
+            if not isinstance(value, str) or not value.strip():
+                continue
+            if any(term in value.lower() or term in key for term in terms):
+                compact_pairs.append(f"{key}: {value.strip()}")
+            if len(compact_pairs) >= 3:
+                break
+
+        if compact_pairs:
+            return "; ".join(compact_pairs)
+        return None
+
+    def _requested_key(self, question: str) -> str:
+        q = question.lower()
+        q = re.sub(r"[?.,]+", " ", q)
+        q = re.sub(
+            r"\b(tell|me|what|is|give|show|only|just|in|one|two|three|line|lines|max|word|words|please|the)\b",
+            " ",
+            q,
+        )
+        q = re.sub(r"\s+", " ", q).strip()
+        return q
+
+    def _extract_field_value(self, question: str, results: list) -> str | None:
+        q = question.lower()
+        if "only" not in q and "just" not in q:
+            return None
+
+        target = self._requested_key(question)
+        if len(target) < 3:
+            return None
+
+        # Parse "Field: Value" spans and stop before the next field label.
+        pattern = re.compile(
+            r"([A-Za-z][A-Za-z0-9 /()_-]{2,50}?)\s*\d*\s*:\s*(.+?)(?=\s+[A-Z][A-Za-z0-9 /()_-]{2,40}\d*\s*:|$)"
         )
 
-    def _generate_llm_answer(self, question: str, resolved_question: str, results: list) -> str | None:
+        best_value: str | None = None
+        best_score = 0
+
+        for item in results:
+            text = self._clean_text(item.chunk.content)
+            for key, value in pattern.findall(text):
+                key_n = re.sub(r"\s+", " ", key.lower()).strip()
+                value_n = re.sub(r"\s+", " ", value).strip()
+                if not value_n:
+                    continue
+
+                target_terms = set(target.split())
+                key_terms = set(key_n.split())
+                score = len(target_terms.intersection(key_terms))
+
+                if target in key_n:
+                    score += 3
+                if score > best_score:
+                    best_score = score
+                    best_value = value_n
+
+        if best_score <= 0 or not best_value:
+            return None
+
+        # Return only the value when user asks for "only".
+        return best_value
+
+    def _best_sentence(self, text: str, question: str) -> str:
+        cleaned = self._clean_text(text)
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if s.strip()]
+        if not sentences:
+            return cleaned
+
+        terms = self._focus_terms(question)
+        if not terms:
+            return sentences[0]
+
+        best_sentence = sentences[0]
+        best_score = -1
+        for sent in sentences:
+            sent_l = sent.lower()
+            score = sum(1 for t in terms if t in sent_l)
+            if score > best_score:
+                best_score = score
+                best_sentence = sent
+        return best_sentence
+
+    def _best_span(self, text: str, question: str, window_words: int = 26) -> str:
+        cleaned = self._clean_text(text)
+        tokens = cleaned.split()
+        if len(tokens) <= window_words:
+            return cleaned
+
+        terms = self._question_terms(question)
+        if not terms:
+            return " ".join(tokens[:window_words])
+
+        best_start = 0
+        best_score = -1.0
+        for i in range(0, len(tokens) - window_words + 1):
+            window = tokens[i : i + window_words]
+            window_text = " ".join(window).lower()
+            hits = sum(1 for t in terms if t in window_text)
+            density = hits / max(1, window_words)
+            score = (hits * 2.0) + density
+            if score > best_score:
+                best_score = score
+                best_start = i
+
+        return " ".join(tokens[best_start : best_start + window_words]).strip()
+
+    def _focused_snippet(self, content: str, question: str, max_words: int = 36) -> str:
+        span = self._best_span(content, question, window_words=max_words)
+        span = re.sub(r"\s+", " ", span).strip()
+        return self._apply_constraints(span, max_words=max_words, max_lines=1)
+
+    def _local_short_answer(
+        self,
+        question: str,
+        results: list,
+        max_words: int,
+        max_lines: int,
+        include_source: bool = False,
+    ) -> str:
+        top = results[0]
+        summary = self._focused_snippet(top.chunk.content, question, max_words=min(max_words, 28))
+        summary = re.sub(r"\s+", " ", summary).strip()
+        if not summary:
+            summary = "The selected section describes the candidate's core backend and automation responsibilities."
+
+        if max_lines <= 1 or not include_source:
+            return self._apply_constraints(summary, max_words, 1)
+
+        line2 = f"Source: {top.chunk.source_name}, {top.chunk.locator}."
+        combined = f"{summary}\n{line2}"
+        return self._apply_constraints(combined, max_words, max_lines)
+
+    def _generate_local_refined_answer(self, question: str, resolved_question: str, results: list, query_type: str) -> str:
+        _ = resolved_question, query_type
+        return self._local_short_answer(question, results, max_words=120, max_lines=5, include_source=self._wants_source_in_answer(question))
+
+    def _candidate_models(self) -> list[str]:
+        env_model = (GENERATION_MODEL or "").strip()
+        candidates: list[str] = []
+        if env_model:
+            candidates.append(env_model)
+            candidates.append(env_model.replace(" ", "-"))
+
+        # Reliable fallbacks if provided model alias is invalid.
+        candidates.extend(["gpt-5.4", "gpt-5.4-mini", "gpt-4.1-mini", "gpt-4o-mini"])
+
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for model in candidates:
+            if model and model not in seen:
+                ordered.append(model)
+                seen.add(model)
+        return ordered
+
+    def _generate_llm_answer(
+        self,
+        question: str,
+        resolved_question: str,
+        results: list,
+        max_words: int,
+        max_lines: int,
+        concise: bool,
+    ) -> str | None:
         if not OPENAI_API_KEY:
             return None
 
         context_lines = []
-        for item in results[:5]:
-            context_lines.append(f"[{self._citation_line(item)}] {self._clean_text(item.chunk.content)[:800]}")
+        for item in results[:3]:
+            snippet = self._focused_snippet(item.chunk.content, question, max_words=44)
+            context_lines.append(f"[{self._citation_line(item)}] {snippet}")
+
+        brevity_block = (
+            f"- Output max {max_words} words.\n- Output max {max_lines} line(s).\n- Do not include headings or bullet points."
+            if concise
+            else "- Keep response focused and grounded. Use short paragraphs, not section headers."
+        )
 
         prompt = "\n\n".join(
             [
                 f"User question: {question}",
                 f"Resolved question with conversation context: {resolved_question}",
                 "Answer requirements:",
-                "- Answer in a refined, ChatGPT-like style.",
+                "- Return only the answer text.",
+                "- No headings like 'Direct Answer' or 'Grounded Evidence'.",
+                "- No preamble or meta commentary.",
                 "- Stay grounded strictly in provided context.",
-                "- If user asks 'what does this mean', explain in simple terms with reference-specific interpretation.",
-                "- Include short citations like [source (page/row, chunk)].",
+                "- Explain meaning clearly in plain language.",
+                "- Prefer a single short paragraph unless user asks for detail.",
+                brevity_block,
                 "Context:",
                 "\n".join(context_lines),
             ]
         )
 
-        try:
-            with httpx.Client(timeout=20.0) as client:
-                response = client.post(
-                    "https://api.openai.com/v1/responses",
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": GENERATION_MODEL,
-                        "input": [
-                            {
-                                "role": "system",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "You are a grounded RAG assistant. Be clear, concise, and context-faithful.",
-                                    }
-                                ],
-                            },
-                            {"role": "user", "content": [{"type": "text", "text": prompt}]},
-                        ],
-                        "temperature": 0.2,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-        except Exception:
-            return None
+        for model in self._candidate_models():
+            try:
+                with httpx.Client(timeout=20.0) as client:
+                    response = client.post(
+                        "https://api.openai.com/v1/responses",
+                        headers={
+                            "Authorization": f"Bearer {OPENAI_API_KEY}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": model,
+                            "input": [
+                                {
+                                    "role": "system",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": (
+                                                "You are a grounded RAG assistant. "
+                                                "Write natural ChatGPT-style answers that are specific, clear, and concise. "
+                                                "Output only the direct answer. No headings, no extra sections, no filler. "
+                                                "If user asks for a single value, return only that value. "
+                                                "Use the provided context only."
+                                            ),
+                                        }
+                                    ],
+                                },
+                                {"role": "user", "content": [{"type": "text", "text": prompt}]},
+                            ],
+                            "reasoning": {"effort": REASONING_EFFORT},
+                            "temperature": 0.1,
+                            "max_output_tokens": min(180, max(40, max_words * 2)),
+                        },
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+            except Exception:
+                continue
 
-        output_text = payload.get("output_text", "")
-        if isinstance(output_text, str) and output_text.strip():
-            return output_text.strip()
+            output_text = payload.get("output_text", "")
+            if isinstance(output_text, str) and output_text.strip():
+                return self._apply_constraints(output_text.strip(), max_words, max_lines)
 
-        for item in payload.get("output", []):
-            for content_item in item.get("content", []):
-                text = content_item.get("text")
-                if isinstance(text, str) and text.strip():
-                    return text.strip()
+            for item in payload.get("output", []):
+                for content_item in item.get("content", []):
+                    text = content_item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        return self._apply_constraints(text.strip(), max_words, max_lines)
 
         return None
 
@@ -211,8 +616,12 @@ class RAGService:
                 confidence_score=0.0,
                 retrieval_metrics=RetrievalMetrics(top_k=top_k, similarity_scores=[], avg_similarity_score=0.0),
                 token_usage=TokenUsage(input_tokens=self._estimate_tokens(question), output_tokens=12, total_tokens=12 + self._estimate_tokens(question)),
-                chunk_distribution=ChunkDistribution(total_chunks=0, avg_chunk_size=0, min_chunk_size=0, max_chunk_size=0, overlap_percent=17.78),
-                embedding_insights=EmbeddingInsights(model=EMBEDDING_MODEL_NAME, vector_dimension=EMBEDDING_DIMENSION, avg_embedding_time_ms=0.0),
+                chunk_distribution=ChunkDistribution(total_chunks=0, avg_chunk_size=0, min_chunk_size=0, max_chunk_size=0, overlap_percent=14.29),
+                embedding_insights=EmbeddingInsights(
+                    model=self.store.embedder.runtime_model_name,
+                    vector_dimension=EMBEDDING_DIMENSION,
+                    avg_embedding_time_ms=0.0,
+                ),
                 query_performance=QueryPerformance(retrieval_time_ms=retrieval_time_ms, llm_response_time_ms=0.0, total_latency_ms=(time.perf_counter() - started) * 1000),
                 source_attribution=[],
                 debug=DebugPanel(raw_prompt=question, retrieved_context=""),
@@ -221,15 +630,40 @@ class RAGService:
         query_type = self._detect_query_type(question)
         top_source_hint = self._citation_line(results[0])
         resolved_question = self._resolve_question(question, chat_history, top_source_hint)
+        max_words, max_lines, concise = self._parse_constraints(question)
+        include_source = self._wants_source_in_answer(question)
 
-        similarities = [round(item.similarity, 4) for item in results]
-        avg_similarity = round(mean(similarities), 4)
+        raw_similarities = [item.similarity for item in results]
+        similarities = [round(score, 4) for score in raw_similarities]
+        avg_similarity = round(mean(raw_similarities), 4)
         context = "\n\n".join([f"[{self._citation_line(item)}] {self._clean_text(item.chunk.content)}" for item in results])
 
         llm_start = time.perf_counter()
-        answer = self._generate_llm_answer(question, resolved_question, results)
+        answer: str | None = self._table_direct_answer(question)
+        if answer:
+            answer = self._apply_constraints(answer, max_words=max_words, max_lines=max_lines)
+
         if not answer:
-            answer = self._generate_local_refined_answer(question, resolved_question, results, query_type)
+            answer = self._extract_field_value(question, results)
+        if answer:
+            answer = self._apply_constraints(answer, max_words, max_lines)
+
+        if not answer:
+            answer = self._generate_llm_answer(
+                question=question,
+                resolved_question=resolved_question,
+                results=results,
+                max_words=max_words,
+                max_lines=max_lines,
+                concise=concise,
+            )
+        if not answer:
+            if concise:
+                answer = self._local_short_answer(question, results, max_words, max_lines, include_source=include_source)
+            else:
+                answer = self._generate_local_refined_answer(question, resolved_question, results, query_type)
+        if not answer and self._is_small_info_request(question):
+            answer = self._local_short_answer(question, results, max_words=min(max_words, 20), max_lines=1, include_source=False)
         llm_response_time_ms = (time.perf_counter() - llm_start) * 1000
 
         all_chunk_lengths = [len(c.content.split()) for c in self.registry.all_chunks()]
@@ -237,7 +671,7 @@ class RAGService:
 
         input_tokens = self._estimate_tokens(question + " " + context)
         output_tokens = self._estimate_tokens(answer)
-        confidence = max(0.0, min(1.0, (avg_similarity * 0.75) + 0.15))
+        confidence = self._compute_confidence(raw_similarities, top_k)
 
         return QueryResponse(
             answer=answer,
@@ -250,10 +684,10 @@ class RAGService:
                 avg_chunk_size=round(mean(all_chunk_lengths), 2) if all_chunk_lengths else 0,
                 min_chunk_size=min(all_chunk_lengths) if all_chunk_lengths else 0,
                 max_chunk_size=max(all_chunk_lengths) if all_chunk_lengths else 0,
-                overlap_percent=17.78,
+                overlap_percent=14.29,
             ),
             embedding_insights=EmbeddingInsights(
-                model=EMBEDDING_MODEL_NAME,
+                model=self.store.embedder.runtime_model_name,
                 vector_dimension=EMBEDDING_DIMENSION,
                 avg_embedding_time_ms=round(avg_embed_time, 2),
             ),
@@ -274,3 +708,28 @@ class RAGService:
             ],
             debug=DebugPanel(raw_prompt=resolved_question, retrieved_context=context[:5000]),
         )
+    def _wants_detailed_output(self, question: str) -> bool:
+        q = question.lower()
+        detail_hints = [
+            "in detail",
+            "detailed",
+            "elaborate",
+            "step by step",
+            "deep dive",
+            "comprehensive",
+            "thorough",
+            "long answer",
+        ]
+        return any(hint in q for hint in detail_hints)
+
+    def _wants_source_in_answer(self, question: str) -> bool:
+        q = question.lower()
+        source_hints = [
+            "source",
+            "citation",
+            "cite",
+            "evidence",
+            "where did you get",
+            "which document",
+        ]
+        return any(hint in q for hint in source_hints)

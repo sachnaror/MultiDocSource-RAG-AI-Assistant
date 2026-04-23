@@ -93,7 +93,11 @@ class JobManager:
 
         chunk_records: list[ChunkRecord] = []
         for record_idx, record in enumerate(records, start=1):
-            chunks = self.chunker.chunk_text(record["content"])
+            record_type = str(record.get("metadata", {}).get("record_type", ""))
+            if source_type == "excel" or record_type == "table_row":
+                chunks = [record["content"]]
+            else:
+                chunks = self.chunker.chunk_text(record["content"])
             if not chunks:
                 continue
 

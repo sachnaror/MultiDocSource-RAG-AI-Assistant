@@ -78,7 +78,11 @@ source .venv/bin/activate
 
 ## Notes
 
-- Embeddings are generated using a local hash-based embedding service (`hash-embedding-v1`, dimension `384`) so the app works offline without paid model keys.
-- Answer generation now supports follow-up context (`chat_history`) and produces grounded, refined explanations instead of raw chunk dumps.
-- Optional: set `OPENAI_API_KEY` to enable model-based answer synthesis via the Responses API.
-- Optional: set `GENERATION_MODEL` (default: `gpt-4.1-mini`).
+- Embeddings use OpenAI by default (`EMBEDDING_MODEL_NAME`, default `text-embedding-3-large`) when `OPENAI_API_KEY` is set.
+- If OpenAI embedding calls are unavailable, the backend automatically falls back to a local hash embedding implementation to stay operational.
+- Answer generation supports follow-up context (`chat_history`) and produces grounded, refined explanations instead of raw chunk dumps.
+- Optional: set `GENERATION_MODEL` (default: `gpt-5.4-mini`).
+- Optional: set `CONFIDENCE_MODE` to `strict` (default), `high`, or `normal`.
+- If your custom model alias fails, the app automatically falls back to `gpt-5.4`, `gpt-5.4-mini`, `gpt-4.1-mini`, and `gpt-4o-mini`.
+- After embedding/chunking/config changes, restart backend and re-ingest documents for best retrieval quality.
+- Excel ingestion is table-aware (sheet/row/column metadata) and row/column questions are answered directly when possible.

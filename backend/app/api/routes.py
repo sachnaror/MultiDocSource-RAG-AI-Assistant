@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from statistics import mean
 
-from app.core.config import EMBEDDING_DIMENSION, EMBEDDING_MODEL_NAME, UPLOAD_DIR
+from app.core.config import EMBEDDING_DIMENSION, UPLOAD_DIR
 from app.models.schemas import (
     APIIngestionRequest,
     DashboardStats,
@@ -98,7 +98,7 @@ async def dashboard() -> DashboardStats:
         retries=registry.counters.retries,
         empty_responses=registry.counters.empty_responses,
         total_queries=registry.counters.total_queries,
-        embeddings_model=EMBEDDING_MODEL_NAME,
+        embeddings_model=job_manager.embedder.runtime_model_name,
         embedding_dimension=EMBEDDING_DIMENSION,
         avg_embedding_time_ms=round(mean(embed_times), 2) if embed_times else 0.0,
         last_updated=registry.last_updated,

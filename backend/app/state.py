@@ -7,4 +7,5 @@ registry = InMemoryRegistry()
 embedder = HashEmbeddingService()
 vector_store = VectorStore(embedder=embedder)
 job_manager = JobManager(registry=registry)
+job_manager.embedder = embedder
 job_manager.vector_store = vector_store
