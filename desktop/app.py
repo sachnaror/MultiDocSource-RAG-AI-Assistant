@@ -35,6 +35,7 @@ class MainWindow(QMainWindow):
         self.client = APIClient()
         self.selected_file: Path | None = None
         self.current_job_id: str | None = None
+        self.chat_history: list[str] = []
 
         self.setWindowTitle("Multi-Format AI Knowledge Assistant")
         self.resize(1500, 900)
@@ -263,9 +264,10 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            result = self.client.query(question, self.top_k_input.value())
+            result = self.client.query(question, self.top_k_input.value(), self.chat_history[-5:])
             self.answer_output.setPlainText(result["answer"])
             self._render_metrics(result)
+            self.chat_history.append(question)
         except Exception as exc:
             QMessageBox.critical(self, "Query failed", str(exc))
 

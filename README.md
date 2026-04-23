@@ -79,5 +79,6 @@ source .venv/bin/activate
 ## Notes
 
 - Embeddings are generated using a local hash-based embedding service (`hash-embedding-v1`, dimension `384`) so the app works offline without paid model keys.
-- LLM response is simulated in deterministic RAG format to keep the architecture testable and production-style.
-- You can replace `RAGService._build_answer` with an actual model call for GPT-based responses.
+- Answer generation now supports follow-up context (`chat_history`) and produces grounded, refined explanations instead of raw chunk dumps.
+- Optional: set `OPENAI_API_KEY` to enable model-based answer synthesis via the Responses API.
+- Optional: set `GENERATION_MODEL` (default: `gpt-4.1-mini`).
