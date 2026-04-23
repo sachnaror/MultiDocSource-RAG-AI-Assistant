@@ -6,6 +6,7 @@ from statistics import mean
 
 import httpx
 
+from app.agents.executor import run_agents
 from app.core.guardrails import STYLE_PROFILES, normalize_query_mode, normalize_response_style
 from app.core.config import (
     CONFIDENCE_MODE,
@@ -813,6 +814,7 @@ class RAGService:
         self,
         question: str,
         top_k: int,
+        source_id: str | None = None,
         chat_history: list[str] | None = None,
         query_mode: str = "auto",
         response_style: str = "concise",
@@ -824,7 +826,10 @@ class RAGService:
         normalized_style = normalize_response_style(response_style)
 
         retrieval_start = time.perf_counter()
-        results = self.store.search(question, self.registry.all_chunks(), top_k=top_k)
+        all_chunks = self.registry.all_chunks()
+        if source_id:
+            all_chunks = [chunk for chunk in all_chunks if chunk.source_id == source_id]
+        results = self.store.search(question, all_chunks, top_k=top_k, source_id=source_id)
         retrieval_time_ms = (time.perf_counter() - retrieval_start) * 1000
 
         if not results:
@@ -891,21 +896,22 @@ class RAGService:
             table_strict_block = True
 
         if not answer and normalized_mode in {"auto", "rag_generate"} and not table_strict_block:
-            answer = self._generate_llm_answer(
-                question=question,
+            answer = run_agents(
+                query=question,
                 resolved_question=resolved_question,
                 results=results,
                 max_words=max_words,
                 max_lines=max_lines,
                 concise=concise,
+                include_source=include_source,
                 style_instruction=style_instruction,
+                top_k=top_k,
+                store=self.store,
+                chunks=all_chunks,
+                llm_generate=self._generate_llm_answer,
+                local_short_answer=self._local_short_answer,
+                apply_constraints=self._apply_constraints,
             )
-
-        if not answer and normalized_mode in {"auto", "rag_generate"} and not table_strict_block:
-            if concise:
-                answer = self._local_short_answer(question, results, max_words, max_lines, include_source=include_source)
-            else:
-                answer = self._generate_local_refined_answer(question, resolved_question, results, query_type)
 
         if (
             not answer

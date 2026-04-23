@@ -5,28 +5,42 @@ Multi-source RAG assistant for **PDF + Excel + API** data with:
 - PyQt desktop client
 - In-memory vector search
 - Deterministic table lookup for precise row/column questions
+- LangGraph multi-agent orchestration for generation path
 
 ## What This App Does
 
 1. Ingests documents and API payloads.
 2. Parses content into normalized records.
 3. Generates embeddings for each record/chunk.
-4. Stores vectors in an in-memory registry.
+4. Stores vectors in either memory or Pinecone.
 5. Answers questions using:
    - deterministic table lookup first (for table-style queries)
-   - then retrieval + constrained generation fallback.
+   - then multi-agent retrieval -> reasoning -> critic -> formatter pipeline.
+
+## Multi-Agent Layer
+
+`backend/app/agents/` is a dedicated orchestration layer (separate from `services/`):
+
+- `retrieval_agent`: gets top relevant chunks
+- `reasoning_agent`: drafts grounded answer
+- `critic_agent`: rejects vague or noisy drafts
+- `formatter_agent`: enforces concise final style
+
+This keeps core RAG deterministic logic clean while making generative answering modular and extensible.
 
 ## Architecture Overview
 
 ### Vector Storage
 
-- This app does **not** use Pinecone/FAISS/pgvector right now.
-- Vector data is stored in-process (RAM) via `InMemoryRegistry`.
-- On backend restart, indexed vectors are lost and must be re-ingested.
+- Supports 2 backends:
+- `memory` (default): vectors kept in-process RAM.
+- `pinecone`: persistent, scalable vector storage.
+- Recommended production strategy: single Pinecone index + metadata filtering by `source_id` (and optional namespace strategy).
 
 Relevant files:
 - [embeddings.py](backend/app/services/embeddings.py)
 - [vector_store.py](backend/app/services/vector_store.py)
+- [pinecone_store.py](backend/app/services/pinecone_store.py)
 - [source_registry.py](backend/app/services/source_registry.py)
 
 ### Embedding Behavior
@@ -74,6 +88,20 @@ Guardrail profile definitions are in:
 MultiDocSource-RAG-AI-Assistant/
 ├── backend/
 │   └── app/
+│       ├── agents/
+│       │   ├── graph.py
+│       │   ├── state.py
+│       │   ├── executor.py
+│       │   ├── nodes/
+│       │   │   ├── retrieval_agent.py
+│       │   │   ├── reasoning_agent.py
+│       │   │   ├── critic_agent.py
+│       │   │   └── formatter_agent.py
+│       │   ├── tools/
+│       │   │   ├── vector_search_tool.py
+│       │   │   └── parser_tool.py
+│       │   └── prompts/
+│       │       └── system_prompts.py
 │       ├── api/
 │       │   └── routes.py
 │       ├── core/
@@ -85,6 +113,7 @@ MultiDocSource-RAG-AI-Assistant/
 │       │   ├── chunking.py
 │       │   ├── embeddings.py
 │       │   ├── parsers.py
+│       │   ├── pinecone_store.py
 │       │   ├── rag.py
 │       │   ├── source_registry.py
 │       │   └── vector_store.py
@@ -121,6 +150,19 @@ export OPENAI_API_KEY=your_real_key
 export GENERATION_MODEL=gpt-5.4
 export CONFIDENCE_MODE=strict
 export TABLE_LOOKUP_MODE=strict
+
+# Vector backend
+export VECTOR_BACKEND=memory
+# or
+export VECTOR_BACKEND=pinecone
+
+# Pinecone (required only when VECTOR_BACKEND=pinecone)
+export PINECONE_API_KEY=your_pinecone_key
+export PINECONE_INDEX_NAME=rag-docs
+export PINECONE_CLOUD=aws
+export PINECONE_REGION=us-east-1
+export PINECONE_NAMESPACE_MODE=single
+export PINECONE_NAMESPACE=default
 ```
 
 Optional:
@@ -130,6 +172,7 @@ Optional:
 - `REASONING_EFFORT` (default `high`)
 - `STRICT_LOOKUP_FAIL_MESSAGE` (custom strict-mode not-found text)
 - Per-query options are passed in request body: `query_mode`, `response_style`
+- Optional query filter: `source_id`
 
 ## Run Backend
 
@@ -163,6 +206,7 @@ source .venv/bin/activate
 - `GET /v1/jobs/{job_id}` - check ingestion job status
 - `POST /v1/query` - ask a question
 - `GET /v1/sources` - list indexed sources
+- `DELETE /v1/sources/{source_id}` - delete source vectors + registry data
 - `GET /v1/dashboard` - summary metrics
 
 Example `/v1/query` payload:
@@ -171,6 +215,7 @@ Example `/v1/query` payload:
 {
   "question": "What is value in row 4 column revenue?",
   "top_k": 2,
+  "source_id": "optional-source-id-filter",
   "chat_history": [],
   "query_mode": "strict_lookup",
   "response_style": "exact"
@@ -223,17 +268,23 @@ Action:
 
 ### “Why did data disappear after restart?”
 
-- Vector storage is in memory currently; restart clears indexed vectors.
-- Re-ingest sources after each backend restart.
+- If `VECTOR_BACKEND=memory`: restart clears vectors.
+- If `VECTOR_BACKEND=pinecone`: vectors persist.
+
+### “How do I update/re-index a document?”
+
+1. Delete old vectors: `DELETE /v1/sources/{source_id}`
+2. Re-upload/re-ingest updated file
+3. Query with `source_id` filter when needed
 
 ## Current Limitations
 
-- No persistent vector DB yet (no Pinecone/FAISS/pgvector integration).
-- In-memory index only.
+- Pinecone is a managed cloud service (not an embedded local DB process).
+- Registry/source stats are still in-memory process state.
 - Deterministic table lookup is strongest for Excel-style row/column questions.
 
 ## Next Recommended Improvements
 
-1. Add persistent vector store (e.g., pgvector or Pinecone).
-2. Add dataset-aware schema extraction for richer table joins across sheets.
-3. Add ingestion versioning plus automatic stale-index warning.
+1. Persist source registry/counters in a database.
+2. Add ingestion versioning and soft-delete + background compaction.
+3. Add multi-tenant authorization-aware metadata filters.

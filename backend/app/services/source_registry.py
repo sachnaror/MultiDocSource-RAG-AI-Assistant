@@ -58,3 +58,11 @@ class InMemoryRegistry:
 
     def all_chunks(self) -> list[ChunkRecord]:
         return self.chunks
+
+    def remove_source(self, source_id: str) -> bool:
+        if source_id not in self.sources:
+            return False
+        self.sources.pop(source_id, None)
+        self.chunks = [chunk for chunk in self.chunks if chunk.source_id != source_id]
+        self.last_updated = datetime.utcnow()
+        return True

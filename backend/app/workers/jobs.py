@@ -12,6 +12,7 @@ from app.services.chunking import Chunker
 from app.services.embeddings import HashEmbeddingService
 from app.services.parsers import ParserService
 from app.services.source_registry import ChunkRecord, InMemoryRegistry, SourceRecord
+from app.services.vector_store import VectorStore
 
 
 @dataclass
@@ -31,6 +32,7 @@ class JobManager:
         self.parser = ParserService()
         self.chunker = Chunker()
         self.embedder = HashEmbeddingService()
+        self.vector_store = VectorStore(embedder=self.embedder)
 
     def create_job(self, message: str = "Queued") -> Job:
         now = datetime.utcnow()
@@ -131,4 +133,5 @@ class JobManager:
             indexed_percent=indexed_percent,
             metadata={"upload_path": str(UPLOAD_DIR)},
         )
+        self.vector_store.upsert_source_chunks(source_id=source_id, chunks=chunk_records)
         self.registry.add_source(source_record, chunk_records)

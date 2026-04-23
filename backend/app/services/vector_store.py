@@ -31,7 +31,21 @@ class VectorStore:
 
         return (semantic * 0.85) + (lexical * 0.15)
 
-    def search(self, query: str, chunks: list[ChunkRecord], top_k: int) -> list[SearchResult]:
+    def upsert_source_chunks(self, source_id: str, chunks: list[ChunkRecord]) -> None:
+        _ = source_id, chunks
+
+    def delete_source(self, source_id: str) -> None:
+        _ = source_id
+
+    def search(
+        self,
+        query: str,
+        chunks: list[ChunkRecord],
+        top_k: int,
+        source_id: str | None = None,
+    ) -> list[SearchResult]:
+        if source_id:
+            chunks = [chunk for chunk in chunks if chunk.source_id == source_id]
         query_vector = self.embedder.embed_text(query).vector
         scored = [SearchResult(chunk=chunk, similarity=self._hybrid_similarity(query, query_vector, chunk)) for chunk in chunks]
         scored.sort(key=lambda item: item.similarity, reverse=True)

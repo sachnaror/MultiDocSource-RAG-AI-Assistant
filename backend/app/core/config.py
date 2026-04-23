@@ -10,6 +10,14 @@ EMBEDDING_DIMENSION = 1536
 EMBEDDING_REQUEST_TIMEOUT_SEC = float(os.getenv("EMBEDDING_REQUEST_TIMEOUT_SEC", "20"))
 DEFAULT_TOP_K = 5
 CHUNK_DENSITY_MULTIPLIER = max(1, int(os.getenv("CHUNK_DENSITY_MULTIPLIER", "10")))
+VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "memory").strip().lower()
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "").strip()
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "rag-docs").strip()
+PINECONE_CLOUD = os.getenv("PINECONE_CLOUD", "aws").strip()
+PINECONE_REGION = os.getenv("PINECONE_REGION", "us-east-1").strip()
+PINECONE_NAMESPACE_MODE = os.getenv("PINECONE_NAMESPACE_MODE", "single").strip().lower()
+PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "default").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GENERATION_MODEL = os.getenv("GENERATION_MODEL", "gpt-5.4-mini")
