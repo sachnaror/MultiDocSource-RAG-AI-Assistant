@@ -14,3 +14,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GENERATION_MODEL = os.getenv("GENERATION_MODEL", "gpt-5.4-mini")
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "high")
 CONFIDENCE_MODE = os.getenv("CONFIDENCE_MODE", "strict").strip().lower()
+TABLE_LOOKUP_MODE = os.getenv("TABLE_LOOKUP_MODE", "strict").strip().lower()
+STRICT_LOOKUP_FAIL_MESSAGE = os.getenv(
+    "STRICT_LOOKUP_FAIL_MESSAGE",
+    "Exact value not found in indexed table data. Re-ingest the file and verify column/row names.",
+).strip()

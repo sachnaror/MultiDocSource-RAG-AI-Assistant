@@ -13,6 +13,8 @@ from app.core.config import (
     GENERATION_MODEL,
     OPENAI_API_KEY,
     REASONING_EFFORT,
+    STRICT_LOOKUP_FAIL_MESSAGE,
+    TABLE_LOOKUP_MODE,
 )
 from app.models.schemas import (
     ChunkDistribution,
@@ -206,6 +208,55 @@ class RAGService:
         cleaned = re.sub(r"[^a-z0-9 _-]", "", cleaned)
         return cleaned
 
+    @staticmethod
+    def _tokenize_key(text: str) -> list[str]:
+        return [t for t in re.split(r"[ _-]+", text) if t]
+
+    @staticmethod
+    def _alias_token(token: str) -> str:
+        alias = {
+            "emp": "employee",
+            "dept": "department",
+            "dob": "birth",
+            "amt": "amount",
+            "qty": "quantity",
+            "num": "number",
+            "no": "number",
+        }
+        return alias.get(token, token)
+
+    def _normalized_tokens(self, text: str) -> list[str]:
+        key = self._normalize_key(text)
+        return [self._alias_token(t) for t in self._tokenize_key(key)]
+
+    def _column_variants(self, column: str) -> set[str]:
+        key = self._normalize_key(column)
+        tokens = self._tokenize_key(key)
+        compact = "".join(tokens)
+        variants = {key, compact, " ".join(tokens), "_".join(tokens), "-".join(tokens)}
+        if tokens:
+            variants.add("".join(t[0] for t in tokens))
+        # Alias-expanded variant for terms like emp->employee.
+        alias_tokens = [self._alias_token(t) for t in tokens]
+        variants.add(" ".join(alias_tokens))
+        variants.add("".join(alias_tokens))
+        return {v.strip() for v in variants if v.strip()}
+
+    def _is_table_query(self, question: str) -> bool:
+        q = question.lower()
+        hints = [
+            "sheet",
+            "row",
+            "column",
+            "table",
+            "cell",
+            "value in",
+            "how many rows",
+            "number of rows",
+            "total rows",
+        ]
+        return any(h in q for h in hints)
+
     def _excel_chunks(self) -> list:
         return [chunk for chunk in self.registry.all_chunks() if chunk.source_type == "excel"]
 
@@ -224,11 +275,35 @@ class RAGService:
 
     def _requested_column(self, question: str, all_columns: set[str]) -> str | None:
         q = self._normalize_key(question)
-        matches = [col for col in all_columns if col and col in q]
-        if not matches:
-            return None
-        matches.sort(key=len, reverse=True)
-        return matches[0]
+        q_tokens = set(self._normalized_tokens(question))
+        best_col: str | None = None
+        best_score = 0.0
+
+        for col in all_columns:
+            if not col:
+                continue
+            variants = self._column_variants(col)
+            if any(v and v in q for v in variants):
+                score = 1.0 + (len(col) / 100.0)
+                if score > best_score:
+                    best_score = score
+                    best_col = col
+                continue
+
+            col_tokens = set(self._normalized_tokens(col))
+            if not col_tokens:
+                continue
+            overlap = len(q_tokens.intersection(col_tokens))
+            if overlap <= 0:
+                continue
+            score = overlap / len(col_tokens)
+            if score > best_score:
+                best_score = score
+                best_col = col
+
+        if best_score >= 0.5:
+            return best_col
+        return None
 
     def _row_filter_terms(self, question: str, requested_column: str | None) -> list[str]:
         tokens = re.findall(r"[a-zA-Z0-9]{2,}", question.lower())
@@ -268,26 +343,43 @@ class RAGService:
             stop.update(requested_column.split())
         return [t for t in tokens if t not in stop]
 
-    def _table_direct_answer(self, question: str) -> str | None:
+    def _table_direct_answer(self, question: str) -> tuple[str | None, bool]:
         excel_chunks = self._excel_chunks()
         if not excel_chunks:
-            return None
+            return None, False
+
+        strict_mode = (TABLE_LOOKUP_MODE or "strict").strip().lower() == "strict"
+        is_table_query = self._is_table_query(question)
+
+        has_structured_rows = any(
+            isinstance(chunk.metadata.get("row_data"), dict) and chunk.metadata.get("row_data")
+            for chunk in excel_chunks
+        )
+        if is_table_query and not has_structured_rows:
+            if strict_mode:
+                return STRICT_LOOKUP_FAIL_MESSAGE, True
+            return None, False
 
         all_columns: set[str] = set()
         for chunk in excel_chunks:
+            row_data = chunk.metadata.get("row_data", {})
+            if isinstance(row_data, dict):
+                all_columns.update(self._normalize_key(k) for k in row_data.keys())
             cols = chunk.metadata.get("columns", [])
             if isinstance(cols, list):
-                all_columns.update(self._normalize_key(c) for c in cols)
+                all_columns.update(self._normalize_key(c) for c in cols if c)
 
         requested_col = self._requested_column(question, all_columns)
         sheet_hint = self._sheet_hint(question)
         row_hint = self._row_hint(question)
         q = question.lower()
+        if requested_col:
+            is_table_query = True
 
         if "column" in q and any(t in q for t in ["what", "which", "list", "show"]):
             candidate_cols = sorted(c for c in all_columns if c)
             if candidate_cols:
-                return ", ".join(candidate_cols)
+                return ", ".join(candidate_cols), False
 
         if any(phrase in q for phrase in ["how many rows", "number of rows", "total rows"]):
             rows = set()
@@ -299,7 +391,7 @@ class RAGService:
                         continue
                     rows.add((sheet, row))
             if rows:
-                return str(len(rows))
+                return str(len(rows)), False
 
         if requested_col and row_hint is not None:
             for chunk in excel_chunks:
@@ -313,11 +405,13 @@ class RAGService:
                 if isinstance(row_data, dict):
                     value = row_data.get(requested_col)
                     if isinstance(value, str) and value.strip():
-                        return value.strip()
+                        return value.strip(), False
 
         terms = self._row_filter_terms(question, requested_col)
         if not terms and not requested_col:
-            return None
+            if is_table_query and strict_mode:
+                return STRICT_LOOKUP_FAIL_MESSAGE, True
+            return None, False
 
         best_chunk = None
         best_score = -1
@@ -338,16 +432,23 @@ class RAGService:
                 best_chunk = chunk
 
         if best_chunk is None or best_score <= 0:
-            return None
+            if is_table_query and strict_mode:
+                return STRICT_LOOKUP_FAIL_MESSAGE, True
+            return None, False
 
         row_data = best_chunk.metadata.get("row_data", {})
         if not isinstance(row_data, dict):
-            return None
+            if is_table_query and strict_mode:
+                return STRICT_LOOKUP_FAIL_MESSAGE, True
+            return None, False
 
         if requested_col:
             value = row_data.get(requested_col)
             if isinstance(value, str) and value.strip():
-                return value.strip()
+                return value.strip(), False
+            if strict_mode:
+                return STRICT_LOOKUP_FAIL_MESSAGE, True
+            return None, False
 
         # If no specific requested column, return the most relevant fields only.
         compact_pairs = []
@@ -360,8 +461,10 @@ class RAGService:
                 break
 
         if compact_pairs:
-            return "; ".join(compact_pairs)
-        return None
+            return "; ".join(compact_pairs), False
+        if is_table_query and strict_mode:
+            return STRICT_LOOKUP_FAIL_MESSAGE, True
+        return None, False
 
     def _requested_key(self, question: str) -> str:
         q = question.lower()
@@ -639,16 +742,18 @@ class RAGService:
         context = "\n\n".join([f"[{self._citation_line(item)}] {self._clean_text(item.chunk.content)}" for item in results])
 
         llm_start = time.perf_counter()
-        answer: str | None = self._table_direct_answer(question)
+        answer: str | None
+        table_answer, table_strict_block = self._table_direct_answer(question)
+        answer = table_answer
         if answer:
             answer = self._apply_constraints(answer, max_words=max_words, max_lines=max_lines)
 
-        if not answer:
+        if not answer and not table_strict_block:
             answer = self._extract_field_value(question, results)
         if answer:
             answer = self._apply_constraints(answer, max_words, max_lines)
 
-        if not answer:
+        if not answer and not table_strict_block:
             answer = self._generate_llm_answer(
                 question=question,
                 resolved_question=resolved_question,
@@ -657,12 +762,12 @@ class RAGService:
                 max_lines=max_lines,
                 concise=concise,
             )
-        if not answer:
+        if not answer and not table_strict_block:
             if concise:
                 answer = self._local_short_answer(question, results, max_words, max_lines, include_source=include_source)
             else:
                 answer = self._generate_local_refined_answer(question, resolved_question, results, query_type)
-        if not answer and self._is_small_info_request(question):
+        if not answer and not table_strict_block and self._is_small_info_request(question):
             answer = self._local_short_answer(question, results, max_words=min(max_words, 20), max_lines=1, include_source=False)
         llm_response_time_ms = (time.perf_counter() - llm_start) * 1000
 

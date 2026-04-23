@@ -83,6 +83,7 @@ source .venv/bin/activate
 - Answer generation supports follow-up context (`chat_history`) and produces grounded, refined explanations instead of raw chunk dumps.
 - Optional: set `GENERATION_MODEL` (default: `gpt-5.4-mini`).
 - Optional: set `CONFIDENCE_MODE` to `strict` (default), `high`, or `normal`.
+- Optional: set `TABLE_LOOKUP_MODE` to `strict` (default) to return exact table values or a clear not-found message instead of vague summaries.
 - If your custom model alias fails, the app automatically falls back to `gpt-5.4`, `gpt-5.4-mini`, `gpt-4.1-mini`, and `gpt-4o-mini`.
 - After embedding/chunking/config changes, restart backend and re-ingest documents for best retrieval quality.
 - Excel ingestion is table-aware (sheet/row/column metadata) and row/column questions are answered directly when possible.
