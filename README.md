@@ -1,21 +1,53 @@
 # MultiDocSource-RAG-AI-Assistant
 
-Multi-Format AI Knowledge Assistant that ingests **PDF + Excel + API** sources, normalizes them into unified chunks, builds embeddings, and supports cross-source question answering with production-style observability.
+Multi-source RAG assistant for **PDF + Excel + API** data with:
+- FastAPI backend
+- PyQt desktop client
+- In-memory vector search
+- Deterministic table lookup for precise row/column questions
 
-## Features
+## What This App Does
 
-- Multi-source ingestion (`pdf`, `excel`, `api`)
-- Async background jobs for ingestion lifecycle
-- Hybrid RAG-style retrieval across structured + unstructured data
-- Source attribution (`document`, `page/row`, `chunk_id`, `similarity`)
-- Retrieval quality metrics (Top-K, score list, average similarity)
-- Token usage stats (input, output, total)
-- Embedding insights (model, vector dimension, avg embedding time)
-- Chunk distribution metrics (avg/min/max chunk size + overlap)
-- Query performance metrics (retrieval, llm, total latency)
-- Debug panel (raw prompt + retrieved context)
-- Error/fallback counters (failed retrievals, empty responses)
-- Desktop UI layout with right-side answer + analytics panels
+1. Ingests documents and API payloads.
+2. Parses content into normalized records.
+3. Generates embeddings for each record/chunk.
+4. Stores vectors in an in-memory registry.
+5. Answers questions using:
+   - deterministic table lookup first (for table-style queries)
+   - then retrieval + constrained generation fallback.
+
+## Architecture Overview
+
+### Vector Storage
+
+- This app does **not** use Pinecone/FAISS/pgvector right now.
+- Vector data is stored in-process (RAM) via `InMemoryRegistry`.
+- On backend restart, indexed vectors are lost and must be re-ingested.
+
+Relevant files:
+- [embeddings.py](backend/app/services/embeddings.py)
+- [vector_store.py](backend/app/services/vector_store.py)
+- [source_registry.py](backend/app/services/source_registry.py)
+
+### Embedding Behavior
+
+- Primary embedding provider: OpenAI embeddings (`text-embedding-3-large` by default).
+- Fallback provider: local hash embedding if OpenAI embedding call fails or key missing.
+
+### Retrieval Behavior
+
+- Query embedding is computed at request time.
+- Similarity uses hybrid scoring (semantic + lexical signal).
+- Top-K results feed answer generation unless deterministic table lookup returns first.
+
+### Deterministic Table Lookup
+
+Excel ingestion stores table metadata (`sheet`, `row`, `columns`, `row_data`).
+
+In `TABLE_LOOKUP_MODE=strict`:
+- exact table answer found -> return exact value
+- exact answer not found -> return explicit not-found message
+- avoids vague LLM fallback for table-style questions
 
 ## Project Structure
 
@@ -24,10 +56,20 @@ MultiDocSource-RAG-AI-Assistant/
 ├── backend/
 │   └── app/
 │       ├── api/
+│       │   └── routes.py
 │       ├── core/
+│       │   └── config.py
 │       ├── models/
+│       │   └── schemas.py
 │       ├── services/
+│       │   ├── chunking.py
+│       │   ├── embeddings.py
+│       │   ├── parsers.py
+│       │   ├── rag.py
+│       │   ├── source_registry.py
+│       │   └── vector_store.py
 │       ├── workers/
+│       │   └── jobs.py
 │       ├── state.py
 │       └── main.py
 ├── desktop/
@@ -50,40 +92,115 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Environment Variables
+
+Recommended:
+
+```bash
+export OPENAI_API_KEY=your_real_key
+export GENERATION_MODEL=gpt-5.4
+export CONFIDENCE_MODE=strict
+export TABLE_LOOKUP_MODE=strict
+```
+
+Optional:
+
+- `EMBEDDING_MODEL_NAME` (default `text-embedding-3-large`)
+- `EMBEDDING_REQUEST_TIMEOUT_SEC` (default `20`)
+- `REASONING_EFFORT` (default `high`)
+- `STRICT_LOOKUP_FAIL_MESSAGE` (custom strict-mode not-found text)
+
 ## Run Backend
 
 ```bash
+source .venv/bin/activate
 ./scripts/run_backend.sh
 ```
 
 Backend URL: `http://127.0.0.1:8000`
 
-## Run Desktop App
-
-Open another terminal in the repo and run:
+Health check:
 
 ```bash
+curl -s http://127.0.0.1:8000/health
+```
+
+## Run Desktop App
+
+Open another terminal:
+
+```bash
+cd /Users/homesachin/Desktop/zoneone/practice/MultiDocSource-RAG-AI-Assistant
 source .venv/bin/activate
 ./scripts/run_desktop.sh
 ```
 
 ## API Endpoints
 
-- `POST /v1/ingest/file` - Upload PDF/Excel
-- `POST /v1/ingest/api` - Ingest API JSON source
-- `GET /v1/jobs/{job_id}` - Check async ingestion status
-- `POST /v1/query` - Ask cross-source question
-- `GET /v1/sources` - List indexed sources
-- `GET /v1/dashboard` - Aggregated system stats
+- `POST /v1/ingest/file` - upload PDF/Excel
+- `POST /v1/ingest/api` - ingest API JSON source
+- `GET /v1/jobs/{job_id}` - check ingestion job status
+- `POST /v1/query` - ask a question
+- `GET /v1/sources` - list indexed sources
+- `GET /v1/dashboard` - summary metrics
 
-## Notes
+## Query Behavior
 
-- Embeddings use OpenAI by default (`EMBEDDING_MODEL_NAME`, default `text-embedding-3-large`) when `OPENAI_API_KEY` is set.
-- If OpenAI embedding calls are unavailable, the backend automatically falls back to a local hash embedding implementation to stay operational.
-- Answer generation supports follow-up context (`chat_history`) and produces grounded, refined explanations instead of raw chunk dumps.
-- Optional: set `GENERATION_MODEL` (default: `gpt-5.4-mini`).
-- Optional: set `CONFIDENCE_MODE` to `strict` (default), `high`, or `normal`.
-- Optional: set `TABLE_LOOKUP_MODE` to `strict` (default) to return exact table values or a clear not-found message instead of vague summaries.
-- If your custom model alias fails, the app automatically falls back to `gpt-5.4`, `gpt-5.4-mini`, `gpt-4.1-mini`, and `gpt-4o-mini`.
-- After embedding/chunking/config changes, restart backend and re-ingest documents for best retrieval quality.
-- Excel ingestion is table-aware (sheet/row/column metadata) and row/column questions are answered directly when possible.
+### Best For Exact Table Answers
+
+Use specific prompts like:
+- `What is value in row 4 column revenue?`
+- `How many rows are in sheet Sales?`
+- `Show columns in sheet Sales`
+- `What is employee_id for row 12 in sheet HR?`
+
+Tips:
+- keep `Top K` low (`1` or `2`) for precision
+- include sheet/row/column names explicitly
+
+### General QA
+
+For non-table questions, the app uses retrieval + generation with concise-answer constraints.
+
+## Important Re-Index Rule
+
+Re-ingestion is required after parser/index logic changes.
+
+If you indexed files before latest table-aware updates, old chunks may lack `row_data` metadata and exact lookup will underperform.
+
+Action:
+1. restart backend
+2. re-upload/re-ingest files
+3. retest queries
+
+## Troubleshooting
+
+### “Answers are vague”
+
+- Ensure `OPENAI_API_KEY` is set before backend start.
+- Set `TABLE_LOOKUP_MODE=strict`.
+- Re-ingest Excel after updates.
+- Use precise row/column wording.
+
+### “Not found” for values that exist
+
+- Column naming mismatch: try exact header spelling from file.
+- Include `sheet` and `row` in query.
+- Re-ingest source to refresh structured metadata.
+
+### “Why did data disappear after restart?”
+
+- Vector storage is in memory currently; restart clears indexed vectors.
+- Re-ingest sources after each backend restart.
+
+## Current Limitations
+
+- No persistent vector DB yet (no Pinecone/FAISS/pgvector integration).
+- In-memory index only.
+- Deterministic table lookup is strongest for Excel-style row/column questions.
+
+## Next Recommended Improvements
+
+1. Add persistent vector store (e.g., pgvector or Pinecone).
+2. Add explicit query mode selector (`strict_lookup` vs `rag_generate`).
+3. Add ingestion versioning + automatic stale-index warning.
